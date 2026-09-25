@@ -39,15 +39,15 @@ class Config:
     top_k_token: int = 20          # rare-token block neighbours per S1
     max_candidates: int = 60       # hard cap after union
     tfidf_min_sim: float = 0.2
-    chunk_size: int = 2000
+    chunk_size: int = 4000
     s1_chunk: int = 20_000         # S1 rows featurised per step (bounds peak RAM)
     # model
     model: str = "xgb"             # xgb (GPU-capable) | lgb
-    device: str = "cuda"           # xgb device; falls back to cpu if CUDA init fails
-    rounds: int = 2000
-    lr: float = 0.05
+    xgb_rounds: int = 2000
+    xgb_lr: float = 0.05
     xgb_depth: int = 8
-    lgb_leaves: int = 63
+    xgb_early_stop: int = 100
+    device: str = "cuda"           # XGBoost on local GPU (RTX 4050); "cpu" fallback
     neg_per_pos_cap: int = 0       # 0 = keep all negatives
     threshold: float = 0.5         # overwritten by tuning
     p_floor: float = 0.02          # test pairs below this are never kept for the decision stage

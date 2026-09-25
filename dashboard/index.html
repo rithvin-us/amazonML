@@ -116,7 +116,7 @@ function lineChart(canvas, series, opts){
   for (let i=0;i<=ticks;i++){
     const y=T+ph*i/ticks, v=hi-(hi-lo)*i/ticks;
     g.beginPath(); g.moveTo(L,y+.5); g.lineTo(L+pw,y+.5); g.stroke();
-    g.fillText(Math.abs(hi-lo)>=20?v.toFixed(0):v.toFixed(1), L-6, y);
+    g.fillText(Math.abs(hi-lo)>=20?v.toFixed(0):Math.abs(hi-lo)>=2?v.toFixed(1):v.toFixed(3), L-6, y);
   }
   // axes
   g.strokeStyle="#4a5160";
@@ -142,7 +142,7 @@ function lineChart(canvas, series, opts){
   let lx=L+4; g.textAlign="left"; g.textBaseline="middle";
   for (const s of series){
     const last = [...s.data].reverse().find(v=>v!==null);
-    const label = s.label + (last!==undefined ? " ("+(Math.abs(last)>=100?last.toFixed(0):last.toFixed(1))+")" : "");
+    const label = s.label + (last!==undefined ? " ("+(Math.abs(last)>=100?last.toFixed(0):Math.abs(last)>=1?last.toFixed(1):last.toFixed(4))+")" : "");
     g.fillStyle=s.color; g.fillRect(lx, 7, 10, 3);
     g.fillStyle="#e6e6e6"; g.fillText(label, lx+14, 9);
     lx += g.measureText(label).width + 30;

@@ -6,6 +6,9 @@
   python pipeline.py predict --run <id>   # test inference with a trained run's model
   python pipeline.py submit --run <id> --team NAME   # build final zip
   python pipeline.py lb <run_id> <score>  # record portal leaderboard score
+
+Model: XGBoost on CUDA by default (--model lgb for LightGBM/CPU). Decision: per-S1 plug-in
+expected-F0.5 or global threshold, whichever wins on validation.
 """
 from __future__ import annotations
 
@@ -18,9 +21,9 @@ import sys
 import zipfile
 from pathlib import Path
 
-import lightgbm as lgb
 import numpy as np
 import polars as pl
+import psutil
 
 from blocking import BlockIndex
 from config import CACHE_DIR, OUTPUT_DIR, ROOT, RUNS_DIR, VALIDATOR, Config
@@ -32,6 +35,12 @@ from tracking import Run, record_lb_score
 SRC_DIR = Path(__file__).resolve().parent
 PROJECT_DIR = SRC_DIR.parent
 NORM_COLS = ["idx", "entity_id"] + TEXT_COLS
+THRESHOLD_GRID = np.round(np.arange(0.05, 0.96, 0.025), 3)
+ALPHA_GRID = [0.0, 0.1, 0.25, 0.5, 1.0, 2.0]
+
+
+def avail_gb() -> float:
+    return psutil.virtual_memory().available / 1e9
 
 
 # ---------------------------------------------------------------- prep (streamed, separate process)
@@ -68,18 +77,19 @@ def countries(split: str) -> list[str]:
 
 
 # ---------------------------------------------------------------- candidates + features
-def iter_country_blocks(split: str, s1_all: pl.DataFrame, cfg: Config, run: Run, s1_chunk: int = 50_000):
+def iter_country_blocks(split: str, s1_all: pl.DataFrame, cfg: Config, run: Run):
     """Yield (country, s1_part, pool_c, pairs_features) per S1 chunk, one country pool in RAM at a time."""
     cs = s1_all["country_n"].unique().sort().to_list()
     done, n_all = 0, s1_all.height
     for c in cs:
         s1_c = s1_all.filter(pl.col("country_n") == c)
         pool_c = scan_norm(split, "pool").filter(pl.col("country_n") == c).select(NORM_COLS).collect()
-        run.log(f"[{c}] S1 {s1_c.height:,}  pool {pool_c.height:,}: building index")
+        run.log(f"[{c}] S1 {s1_c.height:,}  pool {pool_c.height:,}: building index (RAM avail {avail_gb():.1f}GB)")
         index = BlockIndex(pool_c, max_df=cfg.extra.get("max_df", 150))
-        run.log(f"[{c}] index keys kept {index.idf.height:,}/{index.n_keys_total:,}, postings {index.pk.height:,}")
-        for i in range(0, s1_c.height, s1_chunk):
-            part = s1_c.slice(i, s1_chunk)
+        run.log(f"[{c}] index keys kept {len(index.idf):,}/{index.n_keys_total:,}, postings {index.n_postings:,}"
+                f" (RAM avail {avail_gb():.1f}GB)")
+        for i in range(0, s1_c.height, cfg.s1_chunk):
+            part = s1_c.slice(i, cfg.s1_chunk)
             pairs = index.query(part, top_k=cfg.max_candidates, chunk=cfg.chunk_size)
             feats = build_features(pairs, part, pool_c, workers=cfg.n_jobs)
             done += part.height
@@ -89,31 +99,187 @@ def iter_country_blocks(split: str, s1_all: pl.DataFrame, cfg: Config, run: Run,
         gc.collect()
 
 
+# ---------------------------------------------------------------- model (XGBoost GPU / LightGBM)
+def xgb_device(want: str) -> str:
+    """'cuda' only if a tiny CUDA fit actually works; else 'cpu'."""
+    if want != "cuda":
+        return "cpu"
+    try:
+        import xgboost as xgb
+        xgb.train({"device": "cuda", "tree_method": "hist"},
+                  xgb.DMatrix(np.zeros((8, 1), np.float32), label=np.zeros(8)), 1)
+        return "cuda"
+    except Exception:  # noqa: BLE001
+        return "cpu"
+
+
+class Model:
+    """Thin wrapper so train/predict don't care which booster is inside."""
+
+    def __init__(self, kind: str, booster, device: str = "cpu"):
+        self.kind, self.booster, self.device = kind, booster, device
+
+    def predict(self, X: np.ndarray) -> np.ndarray:
+        if self.kind == "xgb":
+            import xgboost as xgb
+            return self.booster.predict(xgb.DMatrix(X, feature_names=FEATURES))
+        return self.booster.predict(X, num_iteration=self.booster.best_iteration or None)
+
+    def save(self, run_dir: Path) -> None:
+        if self.kind == "xgb":
+            self.booster.save_model(str(run_dir / "model.json"))
+        else:
+            self.booster.save_model(str(run_dir / "model.txt"))
+        (run_dir / "model_meta.json").write_text(json.dumps({"kind": self.kind, "device": self.device}))
+
+    @staticmethod
+    def load(run_dir: Path, device: str = "cuda") -> "Model":
+        meta = run_dir / "model_meta.json"
+        kind = json.loads(meta.read_text())["kind"] if meta.exists() else "lgb"
+        if kind == "xgb":
+            import xgboost as xgb
+            b = xgb.Booster()
+            b.load_model(str(run_dir / "model.json"))
+            dev = xgb_device(device)
+            b.set_param({"device": dev})
+            return Model("xgb", b, dev)
+        import lightgbm as lgb
+        return Model("lgb", lgb.Booster(model_file=str(run_dir / "model.txt")))
+
+
+class Curve:
+    """runs/<id>/train_curve.csv, read live by the dashboard."""
+
+    def __init__(self, path: Path):
+        self.path = path
+        path.write_text("iter,train_logloss,val_logloss,val_aucpr\n")
+
+    def add(self, it: int, tr_ll: float, va_ll: float, va_ap: float) -> None:
+        with open(self.path, "a", encoding="utf-8") as f:
+            f.write(f"{it},{tr_ll:.5f},{va_ll:.5f},{va_ap:.5f}\n")
+
+
+def train_model(cfg: Config, run: Run, tr: pl.DataFrame, va: pl.DataFrame) -> Model:
+    Xtr, ytr = tr.select(FEATURES).to_numpy(), tr["label"].to_numpy()
+    Xva, yva = va.select(FEATURES).to_numpy(), va["label"].to_numpy()
+    curve = Curve(run.dir / "train_curve.csv")
+    if cfg.model == "xgb":
+        import xgboost as xgb
+        dev = xgb_device(cfg.device)
+        run.log(f"xgboost {xgb.__version__} device={dev} train {len(ytr):,} val {len(yva):,} "
+                f"pos_rate {ytr.mean():.4f}")
+        # logloss last -> early stopping tracks calibration (the decision stage relies on calibrated p)
+        params = dict(objective="binary:logistic", eval_metric=["aucpr", "logloss"], tree_method="hist",
+                      device=dev, eta=cfg.xgb_lr, max_depth=cfg.xgb_depth, min_child_weight=5, subsample=0.8,
+                      colsample_bytree=0.8, reg_lambda=1.0, max_bin=256, seed=cfg.seed, nthread=cfg.n_jobs)
+        dtr = xgb.QuantileDMatrix(Xtr, ytr, feature_names=FEATURES)
+        dva = xgb.QuantileDMatrix(Xva, yva, ref=dtr, feature_names=FEATURES)
+
+        class Live(xgb.callback.TrainingCallback):
+            def after_iteration(self, model, epoch, evals_log):
+                if epoch % 10 == 0:
+                    t_, v_ = evals_log["train"], evals_log["val"]
+                    curve.add(epoch, t_["logloss"][-1], v_["logloss"][-1], v_["aucpr"][-1])
+                    run.progress(min(epoch / cfg.xgb_rounds, 1.0), f"iter {epoch} val_logloss={v_['logloss'][-1]:.4f}"
+                                 f" val_aucpr={v_['aucpr'][-1]:.4f} [{dev}]")
+                return False
+
+        bst = xgb.train(params, dtr, cfg.xgb_rounds, evals=[(dtr, "train"), (dva, "val")],
+                        early_stopping_rounds=cfg.xgb_early_stop, callbacks=[Live()], verbose_eval=False)
+        best = bst.best_iteration
+        bst = bst[: best + 1]
+        gain = bst.get_score(importance_type="total_gain")
+        imp = {f: round(float(gain.get(f, 0.0)), 1) for f in FEATURES}
+        model = Model("xgb", bst, dev)
+    else:
+        import lightgbm as lgb
+        params = dict(objective="binary", metric=["binary_logloss", "average_precision"], learning_rate=cfg.xgb_lr,
+                      num_leaves=cfg.extra.get("lgb_leaves", 63), min_data_in_leaf=50, feature_fraction=0.8, bagging_fraction=0.8,
+                      bagging_freq=1, lambda_l2=1.0, num_threads=cfg.n_jobs, verbose=-1, seed=cfg.seed)
+        dtr = lgb.Dataset(Xtr, ytr, feature_name=FEATURES)
+        dva = lgb.Dataset(Xva, yva, reference=dtr)
+
+        def _cb(env):
+            if env.iteration % 10 == 0:
+                r = {(e[0], e[1]): e[2] for e in env.evaluation_result_list}
+                curve.add(env.iteration, r[("train", "binary_logloss")], r[("val", "binary_logloss")],
+                          r[("val", "average_precision")])
+                run.progress(min(env.iteration / cfg.xgb_rounds, 1.0),
+                             f"iter {env.iteration} val_logloss={r[('val', 'binary_logloss')]:.4f} [cpu]")
+
+        bst = lgb.train(params, dtr, cfg.xgb_rounds, valid_sets=[dtr, dva], valid_names=["train", "val"],
+                        callbacks=[lgb.early_stopping(cfg.xgb_early_stop, first_metric_only=True, verbose=False), _cb])
+        best = bst.best_iteration
+        imp = dict(zip(FEATURES, bst.feature_importance("gain").round(1).tolist()))
+        model = Model("lgb", bst, "cpu")
+    model.save(run.dir)
+    imp = dict(sorted(imp.items(), key=lambda x: -x[1]))
+    (run.dir / "feature_importance.json").write_text(json.dumps(imp, indent=2))
+    run.set_metrics(model=model.kind, device=model.device, best_iter=best)
+    run.log(f"best iter {best} ({model.kind} on {model.device})")
+    return model
+
+
 # ---------------------------------------------------------------- decision / tuning
-def macro_f05_frame(scored: pl.DataFrame, truth_counts: pl.DataFrame, t: float) -> dict:
-    """scored: s1_idx, label, p. truth_counts: s1_idx, n_true (all eval S1, incl. 0)."""
-    agg = (scored.filter(pl.col("p") >= t).group_by("s1_idx")
-           .agg(pl.len().alias("n_pred"), pl.col("label").sum().alias("tp")))
+def eval_selection(sel: pl.DataFrame, truth_counts: pl.DataFrame) -> dict:
+    """sel: chosen (s1_idx, label) rows. truth_counts: s1_idx, n_true for every eval S1 (incl. 0).
+
+    Per-S1 F0.5 = 1.25*tp / (0.25*n_true + n_pred); 1.0 for a correctly empty singleton.
+    """
+    agg = sel.group_by("s1_idx").agg(pl.len().alias("n_pred"), pl.col("label").sum().alias("tp"))
     df = truth_counts.join(agg, on="s1_idx", how="left").fill_null(0).with_columns(
-        (pl.col("tp") / pl.col("n_pred").clip(1)).alias("P"),
-        (pl.col("tp") / pl.col("n_true").clip(1)).alias("R"))
-    df = df.with_columns(
         pl.when((pl.col("n_true") == 0) & (pl.col("n_pred") == 0)).then(1.0)
-        .when(pl.col("tp") == 0).then(0.0)
-        .otherwise(1.25 * pl.col("P") * pl.col("R") / (0.25 * pl.col("P") + pl.col("R"))).alias("f"))
+        .otherwise(1.25 * pl.col("tp") / (0.25 * pl.col("n_true") + pl.col("n_pred")).clip(1e-9)).alias("f"))
     return {"f05": float(df["f"].mean()),
             "precision": float(df["tp"].sum() / max(df["n_pred"].sum(), 1)),
             "recall": float(df["tp"].sum() / max(df["n_true"].sum(), 1))}
 
 
-def tune_threshold(scored, truth_counts, run: Run) -> tuple[float, dict]:
-    best = (0.5, {"f05": -1})
-    for t in np.round(np.arange(0.05, 0.96, 0.025), 3):
-        m = macro_f05_frame(scored, truth_counts, float(t))
-        if m["f05"] > best[1]["f05"]:
-            best = (float(t), m)
-    run.log(f"best threshold {best[0]} -> {best[1]}")
-    return best
+def select_expected_f(scored: pl.DataFrame, alpha: float) -> pl.DataFrame:
+    """Per S1 keep the top-m candidates (by p) maximising plug-in E[F0.5] = 1.25*E[tp] / (0.25*E[k] + m).
+
+    E[k] = sum(p) + alpha, alpha = expected true matches missed by blocking. The empty list scores
+    P(no match) ~ prod(1-p) * exp(-alpha); it wins for likely singletons.
+    """
+    s = scored.sort(["s1_idx", "p"], descending=[False, True]).with_columns(
+        pl.col("p").cum_sum().over("s1_idx").alias("_ctp"),
+        pl.int_range(1, pl.len() + 1).over("s1_idx").alias("_m"),
+        pl.col("p").sum().over("s1_idx").alias("_ek"),
+        (1 - pl.col("p")).clip(1e-6, 1.0).log().sum().over("s1_idx").alias("_lp0"))
+    s = s.with_columns((1.25 * pl.col("_ctp") / (0.25 * (pl.col("_ek") + alpha) + pl.col("_m"))).alias("_ef"))
+    best = s.group_by("s1_idx").agg(pl.col("_ef").max().alias("_efb"),
+                                    pl.col("_m").sort_by("_ef", descending=True).first().alias("_mb"),
+                                    pl.col("_lp0").first())
+    best = best.select("s1_idx", pl.when(pl.col("_efb") > (pl.col("_lp0") - alpha).exp())
+                       .then(pl.col("_mb")).otherwise(0).alias("_msel"))
+    return (s.join(best, on="s1_idx").filter(pl.col("_m") <= pl.col("_msel"))
+            .drop("_ctp", "_m", "_ek", "_lp0", "_ef", "_msel"))
+
+
+def apply_decision(scored: pl.DataFrame, dec: dict, floor: float) -> pl.DataFrame:
+    if dec["mode"] == "threshold":
+        return scored.filter(pl.col("p") >= dec["param"])
+    return select_expected_f(scored.filter(pl.col("p") >= floor), dec["param"])
+
+
+def exclusive(sel: pl.DataFrame) -> pl.DataFrame:
+    """GT is one-to-many: a pool record matches at most one S1. Keep each cand only for its best-p S1."""
+    return sel.filter(pl.col("p").rank("ordinal", descending=True).over("cand_idx") == 1)
+
+
+def tune_decision(scored: pl.DataFrame, truth_counts: pl.DataFrame, floor: float, run: Run) -> dict:
+    res = {}
+    for t in THRESHOLD_GRID:
+        m = eval_selection(apply_decision(scored, {"mode": "threshold", "param": float(t)}, floor), truth_counts)
+        if m["f05"] > res.get("threshold", {"f05": -1})["f05"]:
+            res["threshold"] = {"mode": "threshold", "param": float(t), **m}
+    for a in ALPHA_GRID:
+        m = eval_selection(apply_decision(scored, {"mode": "expected_f", "param": a}, floor), truth_counts)
+        if m["f05"] > res.get("expected_f", {"f05": -1})["f05"]:
+            res["expected_f"] = {"mode": "expected_f", "param": a, **m}
+    for k, v in res.items():
+        run.log(f"decision {k}: param={v['param']} f05={v['f05']:.5f} P={v['precision']:.4f} R={v['recall']:.4f}")
+    return res
 
 
 # ---------------------------------------------------------------- train
@@ -135,6 +301,8 @@ def train_stage(cfg: Config, run: Run) -> None:
     gt_use = gt.join(idmap_s1, on="s1_id")
     truth_counts = (idmap_s1.join(gt_use.group_by("s1_id").agg(pl.col("match_id").drop_nulls().len().alias("n_true")),
                                   on="s1_id", how="left").fill_null(0))
+    del gt
+    gc.collect()
 
     run.start_stage("blocking+features_train")
     chunks = []
@@ -152,105 +320,158 @@ def train_stage(cfg: Config, run: Run) -> None:
     tv = truth_counts.filter(pl.col("is_val"))
     br = float(feats.filter(pl.col("is_val"))["label"].sum() / max(tv["n_true"].sum(), 1))
     avg_c = feats.filter(pl.col("is_val")).height / max(tv.height, 1)
-    run.log(f"metric val block_recall={br:.4f} avg_cands={avg_c:.1f} pos_rate={feats['label'].mean():.4f}")
-    run.set_metrics(block_recall=round(br, 4), avg_candidates=round(avg_c, 2),
+    zero_c = tv.height - feats.filter(pl.col("is_val"))["s1_idx"].n_unique()
+    run.log(f"metric val block_recall={br:.4f} avg_cands={avg_c:.1f} s1_without_cands={zero_c:,} "
+            f"pos_rate={feats['label'].mean():.4f}")
+    run.set_metrics(block_recall=round(br, 4), avg_candidates=round(avg_c, 2), val_s1_without_cands=zero_c,
                     n_pairs=feats.height, n_s1=s1.height)
 
-    run.start_stage("train_lgbm")
+    run.start_stage("train_model")
     tr, va = feats.filter(~pl.col("is_val")), feats.filter(pl.col("is_val"))
-    params = dict(objective="binary", learning_rate=cfg.lgb_lr, num_leaves=cfg.lgb_leaves,
-                  min_data_in_leaf=50, feature_fraction=0.8, bagging_fraction=0.8, bagging_freq=1,
-                  lambda_l2=1.0, num_threads=cfg.n_jobs, verbose=-1, seed=cfg.seed)
-    dtr = lgb.Dataset(tr.select(FEATURES).to_numpy(), tr["label"].to_numpy(), feature_name=FEATURES)
-    dva = lgb.Dataset(va.select(FEATURES).to_numpy(), va["label"].to_numpy(), reference=dtr)
-
-    def _cb(env):
-        if env.iteration % 25 == 0:
-            msg = " ".join(f"{e[1]}={e[2]:.4f}" for e in env.evaluation_result_list)
-            run.progress(env.iteration / cfg.lgb_rounds, f"iter {env.iteration} {msg}")
-
-    model = lgb.train(params, dtr, cfg.lgb_rounds, valid_sets=[dva], valid_names=["val"],
-                      callbacks=[lgb.early_stopping(50, verbose=False), _cb])
-    model.save_model(str(run.dir / "model.txt"))
-    imp = dict(sorted(zip(FEATURES, model.feature_importance("gain").round(1).tolist()), key=lambda x: -x[1]))
-    (run.dir / "feature_importance.json").write_text(json.dumps(imp, indent=2))
-    run.log(f"best iter {model.best_iteration}")
+    model = train_model(cfg, run, tr, va)
+    del tr
+    gc.collect()
     run.end_stage()
 
     run.start_stage("tune")
-    va = va.with_columns(pl.Series("p", model.predict(va.select(FEATURES).to_numpy(),
-                                                      num_iteration=model.best_iteration)))
-    t, m = tune_threshold(va.select("s1_idx", "label", "p"), tv.select("s1_idx", "n_true"), run)
-    run.set_metrics(threshold=t, val_f05=round(m["f05"], 5), val_precision=round(m["precision"], 4),
-                    val_recall=round(m["recall"], 4), best_iter=model.best_iteration,
+    va = va.select("s1_idx", "cand_idx", "label").with_columns(
+        pl.Series("p", model.predict(va.select(FEATURES).to_numpy()), dtype=pl.Float32))
+    va.write_parquet(run.dir / "val_scored.parquet")  # for offline error analysis / re-decisions
+    tvc = tv.select("s1_idx", "n_true")
+    res = tune_decision(va, tvc, cfg.p_floor, run)
+    dec = max(res.values(), key=lambda d: d["f05"])
+    ex = eval_selection(exclusive(apply_decision(va, dec, cfg.p_floor)), tvc)
+    run.set_metrics(decision_mode=dec["mode"], decision_param=dec["param"],
+                    threshold=res["threshold"]["param"], val_f05=round(dec["f05"], 5),
+                    val_precision=round(dec["precision"], 4), val_recall=round(dec["recall"], 4),
+                    val_f05_threshold=round(res["threshold"]["f05"], 5),
+                    val_f05_expected_f=round(res["expected_f"]["f05"], 5),
+                    val_f05_excl=round(ex["f05"], 5),
                     val_singleton_frac=round(tv.filter(pl.col("n_true") == 0).height / max(tv.height, 1), 4))
     # per-country val breakdown (tells us how France-like generalisation may behave)
     cmap = s1.select(pl.col("idx").alias("s1_idx"), "country_n")
     per_c = {}
     for c in cmap["country_n"].unique().to_list():
         ids_c = cmap.filter(pl.col("country_n") == c)["s1_idx"].implode()
-        per_c[c] = round(macro_f05_frame(va.filter(pl.col("s1_idx").is_in(ids_c)).select("s1_idx", "label", "p"),
-                                         tv.filter(pl.col("s1_idx").is_in(ids_c)).select("s1_idx", "n_true"), t)["f05"], 5)
+        per_c[c] = round(eval_selection(apply_decision(va.filter(pl.col("s1_idx").is_in(ids_c)), dec, cfg.p_floor),
+                                        tvc.filter(pl.col("s1_idx").is_in(ids_c)))["f05"], 5)
     run.set_metrics(val_f05_by_country=per_c)
-    run.log(f"metric val_f05={m['f05']:.5f} P={m['precision']:.4f} R={m['recall']:.4f} t={t} by_country={per_c}")
+    run.log(f"metric val_f05={dec['f05']:.5f} P={dec['precision']:.4f} R={dec['recall']:.4f} "
+            f"decision={dec['mode']}:{dec['param']} by_country={per_c}")
     run.end_stage()
 
 
 # ---------------------------------------------------------------- predict
+def _write_ids(s1_map: pl.DataFrame, lists: pl.DataFrame, col: str, path: Path) -> None:
+    """One row per S1 in source order; lists: s1_idx, ids (comma-joined)."""
+    (s1_map.join(lists, on="s1_idx", how="left", maintain_order="left")
+     .select("source1_entity_id", pl.col("ids").fill_null("").alias(col))
+     .write_csv(path, separator="\t", quote_style="never"))
+
+
+def _join_ids(sel: pl.DataFrame) -> pl.DataFrame:
+    return (sel.sort(["s1_idx", "p"], descending=[False, True])
+            .group_by("s1_idx", maintain_order=True).agg(pl.col("cid").str.join(",").alias("ids")))
+
+
+def _check_id_file(path: Path, col: str, n_s1: int) -> list[str]:
+    """Light polars format check (the official validator holds every candidate id in Python sets -> OOM here)."""
+    df = pl.read_csv(path, separator="\t", quote_char=None, infer_schema=False)
+    issues = []
+    if df.columns != ["source1_entity_id", col]:
+        issues.append(f"header {df.columns}")
+    if df.height != n_s1 or df["source1_entity_id"].n_unique() != n_s1:
+        issues.append(f"rows {df.height} unique {df['source1_entity_id'].n_unique()} expected {n_s1}")
+    ids = df.select(pl.int_range(pl.len()).alias("r"), pl.col(col).str.split(",")).explode(col).drop_nulls()
+    ids = ids.filter(pl.col(col) != "")
+    if ids.filter(~pl.col(col).str.contains(r"^S[23]-")).height:
+        issues.append("non S2/S3 id")
+    if ids.height != ids.unique().height:
+        issues.append("duplicate id within a list")
+    return issues
+
+
 def predict_stage(cfg: Config, run: Run, model_run_dir: Path) -> None:
     metrics = json.loads((model_run_dir / "metrics.json").read_text())
-    t = cfg.extra.get("threshold_override") or metrics["threshold"]
-    model = lgb.Booster(model_file=str(model_run_dir / "model.txt"))
+    dec = {"mode": metrics.get("decision_mode", "threshold"),
+           "param": metrics.get("decision_param", metrics.get("threshold", 0.5))}
+    if cfg.extra.get("threshold_override"):
+        dec = {"mode": "threshold", "param": cfg.extra["threshold_override"]}
+    model = Model.load(model_run_dir, cfg.device)
+    run.log(f"model {model.kind} on {model.device}, decision {dec['mode']}:{dec['param']}")
 
     run.start_stage("prep_test")
     prep("test", run, cfg)
     run.end_stage()
     s1 = scan_norm("test", "s1").select(NORM_COLS).collect()
 
+    # per-chunk results spill to D: (run dir) instead of accumulating in RAM; kept for re-decisions
+    spill = run.dir / "pred"
+    shutil.rmtree(spill, ignore_errors=True)
+    spill.mkdir()
     run.start_stage("blocking+features+predict_test")
-    cand_rows, match_rows = [], []
-    n_pairs = 0
+    n_pairs = part_no = 0
     for c, part, pool_c, feats in iter_country_blocks("test", s1, cfg, run):
-        p = model.predict(feats.select(FEATURES).to_numpy(), num_iteration=model.best_iteration or None)
-        f = (feats.select("s1_idx", "cand_idx", "brank").with_columns(pl.Series("p", p))
-             .join(part.select(pl.col("idx").alias("s1_idx"), pl.col("entity_id").alias("s1_id")), on="s1_idx")
+        p = model.predict(feats.select(FEATURES).to_numpy())
+        f = (feats.select("s1_idx", "cand_idx", "brank").with_columns(pl.Series("p", p, dtype=pl.Float32))
              .join(pool_c.select(pl.col("idx").alias("cand_idx"), pl.col("entity_id").alias("cid")), on="cand_idx"))
         n_pairs += f.height
-        cand_rows.append(f.sort("brank").group_by("s1_id").agg(pl.col("cid").str.join(",").alias("ids")))
-        match_rows.append(f.filter(pl.col("p") >= t).sort("p", descending=True)
-                          .group_by("s1_id").agg(pl.col("cid").str.join(",").alias("ids")))
+        (f.sort(["s1_idx", "brank"]).group_by("s1_idx", maintain_order=True)
+         .agg(pl.col("cid").str.join(",").alias("ids")).write_parquet(spill / f"cand-{part_no:05d}.parquet"))
+        f.filter(pl.col("p") >= cfg.p_floor).select("s1_idx", "cand_idx", "cid", "p").write_parquet(
+            spill / f"scored-{part_no:05d}.parquet")
+        part_no += 1
+        del p, f, feats
     run.end_stage()
 
-    run.start_stage("write_test")
-    all_s1 = s1.select(pl.col("entity_id").alias("source1_entity_id"))
-    cands = all_s1.join(pl.concat(cand_rows), left_on="source1_entity_id", right_on="s1_id", how="left",
-                        maintain_order="left").fill_null("")
-    matches = all_s1.join(pl.concat(match_rows), left_on="source1_entity_id", right_on="s1_id", how="left",
-                          maintain_order="left").fill_null("")
+    run.start_stage("decide+write_test")
+    s1_map = s1.select(pl.col("idx").alias("s1_idx"), pl.col("entity_id").alias("source1_entity_id"))
+    n_s1 = s1_map.height
+    del s1
+    gc.collect()
     out_dir = run.dir / "output"
     out_dir.mkdir(exist_ok=True)
-    cands.rename({"ids": "candidate_entity_ids"}).write_csv(out_dir / "candidate_pairs.tsv", separator="\t",
-                                                            quote_style="never")
-    matches.rename({"ids": "matched_entity_ids"}).write_csv(out_dir / "matching_results.tsv", separator="\t",
-                                                            quote_style="never")
+    _write_ids(s1_map, pl.read_parquet(spill / "cand-*.parquet"), "candidate_entity_ids",
+               out_dir / "candidate_pairs.tsv")
+    gc.collect()
+    scored = pl.read_parquet(spill / "scored-*.parquet")
+    sel = apply_decision(scored, dec, cfg.p_floor)
+    excl = exclusive(sel)
+    del scored
+    _write_ids(s1_map, _join_ids(sel), "matched_entity_ids", out_dir / "matching_results.tsv")
+    _write_ids(s1_map, _join_ids(excl), "matched_entity_ids", out_dir / "matching_results_excl.tsv")
     for fn in ("matching_results.tsv", "candidate_pairs.tsv"):
         shutil.copy(out_dir / fn, OUTPUT_DIR / fn)
-    nonempty = int((matches["ids"] != "").sum())
-    npred = int(matches["ids"].str.split(",").list.len().filter(matches["ids"] != "").sum())
-    run.set_metrics(test_threshold=t, test_s1=all_s1.height, test_nonempty=nonempty, test_pred_pairs=npred,
-                    test_avg_candidates=round(n_pairs / max(all_s1.height, 1), 2))
-    run.log(f"metric test nonempty={nonempty:,}/{all_s1.height:,} pred_pairs={npred:,}")
+    (OUTPUT_DIR / "variants").mkdir(exist_ok=True)
+    shutil.copy(out_dir / "matching_results_excl.tsv", OUTPUT_DIR / "variants" / "matching_results_excl.tsv")
+    nonempty = sel["s1_idx"].n_unique()
+    run.set_metrics(test_decision=f"{dec['mode']}:{dec['param']}", test_s1=n_s1, test_nonempty=nonempty,
+                    test_pred_pairs=sel.height, test_pred_pairs_excl=excl.height,
+                    test_excl_dropped=sel.height - excl.height,
+                    test_avg_candidates=round(n_pairs / max(n_s1, 1), 2))
+    run.log(f"metric test nonempty={nonempty:,}/{n_s1:,} pred_pairs={sel.height:,} "
+            f"excl_dropped={sel.height - excl.height:,} avg_cands={n_pairs / max(n_s1, 1):.1f}")
+    del sel, excl
+    gc.collect()
     run.end_stage()
 
     run.start_stage("validate")
-    r = subprocess.run([sys.executable, str(VALIDATOR), "--matching", str(OUTPUT_DIR / "matching_results.tsv"),
-                        "--candidate", str(OUTPUT_DIR / "candidate_pairs.tsv"),
-                        "--test-dir", str(ROOT / "student_resource" / "dataset" / "test")],
-                       capture_output=True, text=True, encoding="utf-8", errors="replace")
-    (run.dir / "validate.txt").write_text(r.stdout + r.stderr, encoding="utf-8")
-    tail = (r.stdout.strip().splitlines() or [r.stderr[-300:]])[-1]
-    run.log(f"metric validator exit={r.returncode}: {tail}")
-    run.set_metrics(validator_pass=r.returncode == 0)
+    test_dir = ROOT / "student_resource" / "dataset" / "test"
+    ok = True
+    report = []
+    for fn in ("matching_results.tsv", "variants/matching_results_excl.tsv"):
+        r = subprocess.run([sys.executable, str(VALIDATOR), "--matching", str(OUTPUT_DIR / fn),
+                            "--test-dir", str(test_dir)],
+                           capture_output=True, text=True, encoding="utf-8", errors="replace")
+        report.append(f"== {fn}\n{r.stdout}{r.stderr}")
+        tail = (r.stdout.strip().splitlines() or [r.stderr[-300:]])[-1]
+        run.log(f"metric validator {fn} exit={r.returncode}: {tail}")
+        ok &= r.returncode == 0
+    cand_issues = _check_id_file(OUTPUT_DIR / "candidate_pairs.tsv", "candidate_entity_ids", n_s1)
+    report.append(f"== candidate_pairs.tsv (polars check)\n{cand_issues or 'OK'}")
+    run.log(f"metric candidate_pairs check: {cand_issues or 'OK'}")
+    (run.dir / "validate.txt").write_text("\n".join(report), encoding="utf-8")
+    run.set_metrics(validator_pass=ok and not cand_issues)
     run.end_stage()
 
 
@@ -276,13 +497,16 @@ def main() -> None:
     ap.add_argument("args", nargs="*")
     ap.add_argument("--sample", type=float, default=1.0)
     ap.add_argument("--name", default=None)
-    ap.add_argument("--run", default=None, help="run id holding model.txt (predict/submit)")
+    ap.add_argument("--run", default=None, help="run id holding the model (predict/submit)")
     ap.add_argument("--team", default="team")
     ap.add_argument("--max-cands", type=int, default=40)
     ap.add_argument("--train-max-s1", type=int, default=150_000)
     ap.add_argument("--max-df", type=int, default=150)
     ap.add_argument("--threshold", type=float, default=None)
     ap.add_argument("--prep-workers", type=int, default=6)
+    ap.add_argument("--model", choices=["xgb", "lgb"], default="xgb")
+    ap.add_argument("--device", choices=["cuda", "cpu"], default="cuda")
+    ap.add_argument("--s1-chunk", type=int, default=20_000)
     a = ap.parse_args()
 
     if a.cmd == "lb":
@@ -295,6 +519,7 @@ def main() -> None:
 
     cfg = Config(run_name=a.name or (f"dev{a.sample}" if a.sample < 1 else a.cmd), sample=a.sample)
     cfg.max_candidates = a.max_cands
+    cfg.model, cfg.device, cfg.s1_chunk = a.model, a.device, a.s1_chunk
     cfg.extra.update(train_max_s1=a.train_max_s1, max_df=a.max_df, threshold_override=a.threshold,
                      prep_workers=a.prep_workers)
     run = Run(cfg.run_name, cfg.to_dict())
@@ -307,11 +532,14 @@ def main() -> None:
                 run.end_stage()
             if a.cmd in ("train", "all"):
                 train_stage(cfg, run)
+                gc.collect()
             if a.cmd == "predict":
                 predict_stage(cfg, run, RUNS_DIR / a.run)
             if a.cmd == "all":
                 predict_stage(cfg, run, run.dir)
-        run.finish(cfg.sample)
+        m = run.metrics
+        run.finish(cfg.sample, notes=f"{m.get('model', '')}/{m.get('device', '')} {m.get('decision_mode', '')}:"
+                                     f"{m.get('decision_param', '')}")
     except BaseException as e:  # noqa: BLE001
         run.log(f"FAILED: {type(e).__name__}: {e}")
         run.finish(cfg.sample, state="failed")
