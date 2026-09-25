@@ -71,11 +71,12 @@ def state(rid):
         "run": rid,
         "status": read_json(d / "status.json") if d else None,
         "metrics": read_json(d / "metrics.json") if d else None,
-        "log_tail": tail(d / "log.txt") if d else None,
+        "log_tail": tail(d / "log.txt", 150) if d else None,
         "hw": (read_csv(d / "hw.csv", 400) or []) if d else [],
         "curve": (read_csv(d / "train_curve.csv", 2000) or []) if d else [],
         "leaderboard": read_csv(RUNS / "leaderboard.csv") or [],
         "feature_importance": read_json(d / "feature_importance.json") if d else None,
+        "config": read_json(d / "config.json") if d else None,
     }
 
 

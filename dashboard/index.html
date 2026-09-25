@@ -42,6 +42,25 @@ pre{margin:0;background:#0b0d11;border:1px solid var(--line);border-radius:6px;p
 pre .m{color:var(--acc)}pre .e{color:var(--bad)}
 .ok{color:var(--ok)}.warn{color:var(--warn)}.bad{color:var(--bad)}
 #err{color:var(--bad);font-size:12px}
+
+/* Pipeline Stepper & Progress Stream */
+.stepper{display:flex;gap:8px;flex-wrap:wrap;margin-top:4px}
+.step{padding:8px 12px;background:var(--bg);border:1px solid var(--line);border-radius:6px;font-size:12px;color:var(--mute);display:flex;align-items:center;gap:6px;transition:all .3s}
+.step .dot{width:8px;height:8px;border-radius:50%;background:var(--mute)}
+.step.active{border-color:var(--acc);color:var(--acc);font-weight:600;background:#132433}
+.step.active .dot{background:var(--acc);box-shadow:0 0 8px var(--acc)}
+.step.done{border-color:var(--ok);color:var(--ok)}
+.step.done .dot{background:var(--ok)}
+
+.term-stream{background:#0b0d11;border:1px solid var(--line);border-radius:6px;padding:10px;height:240px;overflow-y:auto;display:flex;flex-direction:column;gap:6px;font:12px/1.4 Consolas,"Courier New",monospace}
+.term-item{display:flex;align-items:baseline;gap:10px;border-bottom:1px solid #1a1e27;padding-bottom:4px}
+.term-time{color:var(--mute);font-size:11px;min-width:65px}
+.term-tag{padding:1px 6px;border-radius:4px;font-size:10px;font-weight:600;text-transform:uppercase;background:#1e293b;color:var(--acc)}
+.term-tag.iter{background:#0284c7;color:#fff}
+.term-tag.metric{background:#166534;color:#4ade80}
+.term-tag.stage{background:#7c2d12;color:#ff8a65}
+.term-msg{color:var(--fg);flex:1}
+.sec-hdr{grid-column:1/-1;font-size:12px;font-weight:700;text-transform:uppercase;letter-spacing:.08em;color:var(--acc);border-bottom:1px solid var(--line);padding:12px 0 4px;margin-top:6px}
 </style>
 </head>
 <body>
@@ -58,7 +77,24 @@ pre .m{color:var(--acc)}pre .e{color:var(--bad)}
   <div id="note"></div>
 </header>
 <main>
+  <!-- 1. HERO SECTION: STAGE STEPPER, KPI STAT CARDS & ALL GRAPHS -->
+  <div class="sec-hdr">1. Hero Section — Status &amp; Performance Graphs</div>
+  
+  <div class="panel wide">
+    <h2>Pipeline Stage &amp; Training Level Stepper</h2>
+    <div id="stageStepper" class="stepper">
+      <div class="step" id="st_prep"><span class="dot"></span> 1. Prep</div>
+      <div class="step" id="st_block_tr"><span class="dot"></span> 2. Train Blocking</div>
+      <div class="step" id="st_train"><span class="dot"></span> 3. Model Training</div>
+      <div class="step" id="st_tune"><span class="dot"></span> 4. Threshold Tuning</div>
+      <div class="step" id="st_predict"><span class="dot"></span> 5. Test Inference</div>
+      <div class="step" id="st_validate"><span class="dot"></span> 6. Validation</div>
+    </div>
+  </div>
+
   <div class="cards">
+    <div class="card" style="border-color:var(--acc)"><div class="l">Model Trained %</div><div class="v" id="c_model_pct" style="color:var(--acc)">—</div></div>
+    <div class="card" style="border-color:var(--ok)"><div class="l">Training Level</div><div class="v" id="c_level" style="color:var(--ok)">—</div></div>
     <div class="card"><div class="l">CPU</div><div class="v" id="c_cpu">—</div></div>
     <div class="card"><div class="l">CPU MHz</div><div class="v" id="c_mhz">—</div></div>
     <div class="card"><div class="l">RAM</div><div class="v" id="c_ram">—</div></div>
@@ -69,16 +105,26 @@ pre .m{color:var(--acc)}pre .e{color:var(--bad)}
     <div class="card"><div class="l">VRAM</div><div class="v" id="c_vram">—</div></div>
     <div class="card"><div class="l">GPU throttle</div><div class="v" id="c_thr">—</div></div>
   </div>
+
+  <!-- HERO GRAPHS -->
+  <div class="panel"><h2>Model Trained % &amp; Iteration Progress Graph</h2><canvas id="ch_model_prog"></canvas></div>
+  <div class="panel"><h2>Training curve: logloss (train/val) &amp; val AUC-PR</h2><canvas id="ch_curve"></canvas></div>
   <div class="panel"><h2>Live GPU util % &amp; temp C (last 300 samples)</h2><canvas id="ch_live"></canvas></div>
   <div class="panel"><h2>Run: CPU % &amp; RAM %</h2><canvas id="ch_cpu"></canvas></div>
   <div class="panel"><h2>Run: GPU util % &amp; temp C</h2><canvas id="ch_gpu"></canvas></div>
   <div class="panel"><h2>Run: GPU SM clock vs max (MHz)</h2><canvas id="ch_sm"></canvas></div>
   <div class="panel"><h2>Run: CPU MHz</h2><canvas id="ch_mhz"></canvas></div>
-  <div class="panel"><h2>Training curve: logloss (train/val) &amp; val AUC-PR</h2><canvas id="ch_curve"></canvas></div>
+
+  <!-- 2. DETAILED ANALYSIS & TABLES SECTION (Below Graphs) -->
+  <div class="sec-hdr">2. Metrics, Feature Importance &amp; Leaderboard</div>
   <div class="panel"><h2>Metrics</h2><div class="tw"><table id="metrics"></table></div></div>
   <div class="panel"><h2>Feature importance (top 20, gain)</h2><div id="fi" class="fi"></div></div>
   <div class="panel wide"><h2>Leaderboard</h2><div class="tw"><table id="lb"></table></div></div>
-  <div class="panel wide"><h2>Log tail</h2><pre id="log">—</pre></div>
+
+  <!-- 3. LOGS & TERMINAL STREAM SECTION (Bottom) -->
+  <div class="sec-hdr">3. Terminal Logs &amp; Progress Stream</div>
+  <div class="panel wide"><h2>Terminal Output Model Progress Stream (Live Updates)</h2><div id="termStream" class="term-stream"></div></div>
+  <div class="panel wide"><h2>Raw Terminal Log Tail</h2><pre id="log">—</pre></div>
 </main>
 <script>
 "use strict";
@@ -125,7 +171,7 @@ function lineChart(canvas, series, opts){
   const xl = opts.xlabels || [];
   g.textAlign="center"; g.textBaseline="top"; g.fillStyle="#8a93a6";
   if (n>1 && xl.length){ for (const i of [0, Math.floor((n-1)/2), n-1]){ const x=L+pw*i/(n-1); g.fillText(xl[i]||"", x, T+ph+5); } }
-  if (!n){ g.textAlign="center"; g.textBaseline="middle"; g.fillText("no data", L+pw/2, T+ph/2); }
+  if (!n){ g.textAlign="center"; g.textBaseline="middle"; g.fillStyle="#8a93a6"; g.fillText(opts.emptyText || "no curve data (run is in prep/blocking stage)", L+pw/2, T+ph/2); }
   // lines
   for (const s of series){
     g.strokeStyle=s.color; g.lineWidth=1.6; g.beginPath(); let pen=false;
@@ -160,11 +206,146 @@ function drawRunCharts(){
   lineChart($("ch_gpu"), [{label:"GPU util %",color:"#66bb6a",data:col(hw,"gpu_util")},{label:"GPU temp C",color:"#ff8a65",data:col(hw,"gpu_temp_c")}], {fixed:[0,100],xlabels:xl});
   lineChart($("ch_sm"), [{label:"SM clock",color:"#4fc3f7",data:col(hw,"gpu_sm_clock")},{label:"SM max",color:"#8a93a6",data:col(hw,"gpu_sm_clock_max")}], {xlabels:xl});
   lineChart($("ch_mhz"), [{label:"CPU MHz",color:"#ffd54f",data:col(hw,"cpu_freq_mhz")}], {xlabels:xl});
+  
   const curve = (lastState && lastState.curve) || [];
   lineChart($("ch_curve"), [{label:"train logloss",color:"#4fc3f7",data:col(curve,"train_logloss")},{label:"val logloss",color:"#ffb74d",data:col(curve,"val_logloss")},{label:"val AUC-PR",color:"#66bb6a",data:col(curve,"val_aucpr")}], {xlabels:curve.map(r=>r.iter)});
+  
+  // Model Trained % Graph
+  const maxRounds = (lastState && lastState.config && (lastState.config.xgb_rounds || lastState.config.lgb_rounds)) || 2000;
+  const pctData = curve.map(r => {
+    const it = num(r.iter);
+    return it !== null ? Math.min(100, Math.round((it / maxRounds) * 100)) : null;
+  });
+  const aucData = curve.map(r => {
+    const a = num(r.val_aucpr);
+    return a !== null ? a * 100 : null; // scale AUC-PR to percentage
+  });
+  lineChart($("ch_model_prog"), [
+    {label:"Model Trained %", color:"#4fc3f7", data:pctData},
+    {label:"Val AUC-PR %", color:"#66bb6a", data:aucData}
+  ], {fixed:[0,100], xlabels:curve.map(r=>"iter "+r.iter)});
 }
+
 function drawLive(){
   lineChart($("ch_live"), [{label:"GPU util %",color:"#66bb6a",data:live.map(r=>num(r.gpu_util))},{label:"GPU temp C",color:"#ff8a65",data:live.map(r=>num(r.gpu_temp_c))}], {fixed:[0,100],xlabels:live.map(r=>r._t)});
+}
+
+/* ---------- Stepper & Model Level ---------- */
+const STAGE_ORDER = ["prep", "blocking+features_train", "train_model", "tune", "blocking+features+predict_test", "validate"];
+const STAGE_MAP = {
+  "prep": "st_prep",
+  "prep_train": "st_prep",
+  "prep_test": "st_prep",
+  "blocking+features_train": "st_block_tr",
+  "train_lgbm": "st_train",
+  "train_model": "st_train",
+  "tune": "st_tune",
+  "blocking+features+predict_test": "st_predict",
+  "validate": "st_validate",
+  "write_test": "st_predict"
+};
+
+function renderStepperAndLevel(st){
+  const s = st.status || {};
+  const curStage = s.stage || "";
+  const curId = STAGE_MAP[curStage] || "";
+  const curIdx = STAGE_ORDER.indexOf(curStage.includes("prep") ? "prep" : curStage.includes("train") ? (curStage.includes("blocking") ? "blocking+features_train" : "train_model") : curStage);
+  
+  // Stepper updates
+  STAGE_ORDER.forEach((stg, idx) => {
+    const elId = STAGE_MAP[stg];
+    if (!elId) return;
+    const el = $(elId);
+    if (!el) return;
+    el.className = "step";
+    if (s.state === "done") {
+      el.className = "step done";
+    } else if (stg === curStage || elId === curId) {
+      el.className = "step active";
+    } else if (curIdx !== -1 && idx < curIdx) {
+      el.className = "step done";
+    }
+  });
+
+  // Model Trained % & Level calculation
+  const cfg = st.config || {};
+  const maxRounds = cfg.xgb_rounds || cfg.lgb_rounds || 2000;
+  const curve = st.curve || [];
+  let trainedPct = 0;
+  let levelTxt = "Level 1: Prep";
+  
+  if (s.state === "done") {
+    trainedPct = 100;
+    levelTxt = "Level 6: Complete (100%)";
+  } else if (curStage === "prep" || curStage === "prep_train") {
+    trainedPct = Math.round((s.pct || 0) * 15);
+    levelTxt = "Level 1: Preprocessing";
+  } else if (curStage === "blocking+features_train") {
+    trainedPct = 15 + Math.round((s.pct || 0) * 25);
+    levelTxt = "Level 2: Train Blocking";
+  } else if (curStage === "train_model" || curStage === "train_lgbm") {
+    if (curve.length) {
+      const lastIter = num(curve[curve.length - 1].iter) || 0;
+      trainedPct = Math.min(100, Math.round((lastIter / maxRounds) * 100));
+    } else {
+      trainedPct = 40;
+    }
+    levelTxt = `Level 3: Training (${trainedPct}%)`;
+  } else if (curStage === "tune") {
+    trainedPct = 100;
+    levelTxt = "Level 4: Threshold Tuning";
+  } else if (curStage === "blocking+features+predict_test" || curStage === "write_test") {
+    trainedPct = 100; // model is fully trained by inference time!
+    levelTxt = "Level 5: Test Inference";
+  } else if (curStage === "validate") {
+    trainedPct = 100;
+    levelTxt = "Level 6: Validating Output";
+  }
+
+  $("c_model_pct").textContent = trainedPct + "%";
+  $("c_level").textContent = levelTxt;
+}
+
+/* ---------- Terminal Output Progress Stream ---------- */
+function renderTermStream(txt){
+  const el = $("termStream");
+  if (!txt) { el.innerHTML = `<div class="term-item"><span class="term-msg">${DASH}</span></div>`; return; }
+  
+  const lines = txt.split("\n");
+  const filtered = [];
+  
+  lines.forEach(l => {
+    if (!l.trim()) return;
+    const timeMatch = l.match(/\[(\d{2}:\d{2}:\d{2})\]/);
+    const time = timeMatch ? timeMatch[1] : "";
+    
+    if (l.includes("stage start") || l.includes("stage done")) {
+      const stageName = l.split("]")[1] ? l.split("]")[1].trim() : l;
+      filtered.push({time, tag:"stage", tagCls:"stage", msg:stageName});
+    } else if (l.includes("iter ") || l.includes("PROGRESS ")) {
+      filtered.push({time, tag:"iter", tagCls:"iter", msg:l.replace(/^\[\d{2}:\d{2}:\d{2}\]\s*/, "")});
+    } else if (l.includes("metric") || l.includes("best iter") || l.includes("decision")) {
+      filtered.push({time, tag:"metric", tagCls:"metric", msg:l.replace(/^\[\d{2}:\d{2}:\d{2}\]\s*/, "")});
+    } else if (l.includes("blocked+featurised") || l.includes("building index") || l.includes("xgboost")) {
+      filtered.push({time, tag:"log", tagCls:"", msg:l.replace(/^\[\d{2}:\d{2}:\d{2}\]\s*/, "")});
+    }
+  });
+
+  if (!filtered.length) {
+    el.innerHTML = `<div class="term-item"><span class="term-msg">No progress events logged yet.</span></div>`;
+    return;
+  }
+
+  const html = filtered.slice(-35).map(item => `
+    <div class="term-item">
+      <span class="term-time">${esc(item.time || "LOG")}</span>
+      <span class="term-tag ${esc(item.tagCls)}">${esc(item.tag)}</span>
+      <span class="term-msg">${esc(item.msg)}</span>
+    </div>
+  `).join("");
+  
+  el.innerHTML = html;
+  el.scrollTop = el.scrollHeight;
 }
 
 /* ---------- header ---------- */
@@ -280,7 +461,7 @@ async function pollState(){
     const r = await fetch("/api/state"+(selectedRun?"?run="+encodeURIComponent(selectedRun):""), {cache:"no-store"});
     const st = await r.json();
     lastState = st;
-    renderRunSel(st); renderHeader(st); renderMetrics(st.metrics); renderLB(st.leaderboard); renderFI(st.feature_importance); renderLog(st.log_tail);
+    renderRunSel(st); renderHeader(st); renderStepperAndLevel(st); renderMetrics(st.metrics); renderLB(st.leaderboard); renderFI(st.feature_importance); renderLog(st.log_tail); renderTermStream(st.log_tail);
     drawRunCharts();
   }catch(e){ $("err").textContent = "state: "+e; }
 }

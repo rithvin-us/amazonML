@@ -85,7 +85,8 @@ def iter_country_blocks(split: str, s1_all: pl.DataFrame, cfg: Config, run: Run)
         s1_c = s1_all.filter(pl.col("country_n") == c)
         pool_c = scan_norm(split, "pool").filter(pl.col("country_n") == c).select(NORM_COLS).collect()
         run.log(f"[{c}] S1 {s1_c.height:,}  pool {pool_c.height:,}: building index (RAM avail {avail_gb():.1f}GB)")
-        index = BlockIndex(pool_c, max_df=cfg.extra.get("max_df", 150))
+        index = BlockIndex(pool_c, max_df=cfg.extra.get("max_df", 150),
+                           chunk=cfg.extra.get("index_chunk", 100_000))  # smaller key-build batches = lower peak RAM
         run.log(f"[{c}] index keys kept {len(index.idf):,}/{index.n_keys_total:,}, postings {index.n_postings:,}"
                 f" (RAM avail {avail_gb():.1f}GB)")
         for i in range(0, s1_c.height, cfg.s1_chunk):
@@ -159,21 +160,45 @@ class Curve:
             f.write(f"{it},{tr_ll:.5f},{va_ll:.5f},{va_ap:.5f}\n")
 
 
-def train_model(cfg: Config, run: Run, tr: pl.DataFrame, va: pl.DataFrame) -> Model:
-    Xtr, ytr = tr.select(FEATURES).to_numpy(), tr["label"].to_numpy()
+def _train_parts(files: list[Path]) -> pl.DataFrame:
+    return pl.concat([pl.read_parquet(f).filter(~pl.col("is_val")) for f in files])
+
+
+def train_model(cfg: Config, run: Run, train_files: list[Path], va: pl.DataFrame) -> Model:
+    """train_files: per-chunk feature parquet on D: (is_val rows skipped); va: in-RAM validation frame."""
     Xva, yva = va.select(FEATURES).to_numpy(), va["label"].to_numpy()
     curve = Curve(run.dir / "train_curve.csv")
     if cfg.model == "xgb":
         import xgboost as xgb
         dev = xgb_device(cfg.device)
-        run.log(f"xgboost {xgb.__version__} device={dev} train {len(ytr):,} val {len(yva):,} "
-                f"pos_rate {ytr.mean():.4f}")
+
+        class PartIter(xgb.DataIter):
+            """Streams train parts from disk into the quantile sketch: host RAM ~ one part at a time."""
+
+            def __init__(self):
+                self.i = 0
+                super().__init__()
+
+            def next(self, input_data) -> bool:
+                if self.i == len(train_files):
+                    return False
+                df = pl.read_parquet(train_files[self.i]).filter(~pl.col("is_val"))
+                input_data(data=df.select(FEATURES).to_numpy(), label=df["label"].to_numpy(),
+                           feature_names=FEATURES)
+                self.i += 1
+                return True
+
+            def reset(self) -> None:
+                self.i = 0
+
         # logloss last -> early stopping tracks calibration (the decision stage relies on calibrated p)
         params = dict(objective="binary:logistic", eval_metric=["aucpr", "logloss"], tree_method="hist",
                       device=dev, eta=cfg.xgb_lr, max_depth=cfg.xgb_depth, min_child_weight=5, subsample=0.8,
                       colsample_bytree=0.8, reg_lambda=1.0, max_bin=256, seed=cfg.seed, nthread=cfg.n_jobs)
-        dtr = xgb.QuantileDMatrix(Xtr, ytr, feature_names=FEATURES)
+        dtr = xgb.QuantileDMatrix(PartIter(), max_bin=256)
         dva = xgb.QuantileDMatrix(Xva, yva, ref=dtr, feature_names=FEATURES)
+        run.log(f"xgboost {xgb.__version__} device={dev} train {dtr.num_row():,} rows (streamed from "
+                f"{len(train_files)} parts) val {len(yva):,} pos_rate_val {yva.mean():.4f}")
 
         class Live(xgb.callback.TrainingCallback):
             def after_iteration(self, model, epoch, evals_log):
@@ -193,6 +218,9 @@ def train_model(cfg: Config, run: Run, tr: pl.DataFrame, va: pl.DataFrame) -> Mo
         model = Model("xgb", bst, dev)
     else:
         import lightgbm as lgb
+        tr = _train_parts(train_files)
+        Xtr, ytr = tr.select(FEATURES).to_numpy(), tr["label"].to_numpy()
+        del tr
         params = dict(objective="binary", metric=["binary_logloss", "average_precision"], learning_rate=cfg.xgb_lr,
                       num_leaves=cfg.extra.get("lgb_leaves", 63), min_data_in_leaf=50, feature_fraction=0.8, bagging_fraction=0.8,
                       bagging_freq=1, lambda_l2=1.0, num_threads=cfg.n_jobs, verbose=-1, seed=cfg.seed)
@@ -292,7 +320,7 @@ def train_stage(cfg: Config, run: Run) -> None:
     s1_ids = scan_norm("train", "s1").select("entity_id").collect()["entity_id"]
     n_use = min(int(s1_ids.len() * cfg.sample), cfg.extra.get("train_max_s1", 150_000))
     use = s1_ids.sample(n=n_use, seed=cfg.seed, shuffle=True)
-    val_ids = use.head(int(n_use * cfg.val_frac))
+    val_ids = use.head(min(int(n_use * cfg.val_frac), cfg.extra.get("val_max_s1", 40_000)))
     s1 = (scan_norm("train", "s1").filter(pl.col("entity_id").is_in(use.implode())).select(NORM_COLS)
           .collect().with_columns(pl.col("entity_id").is_in(val_ids.implode()).alias("is_val")))
     run.log(f"S1 used {s1.height:,} (val {val_ids.len():,})")
@@ -304,32 +332,42 @@ def train_stage(cfg: Config, run: Run) -> None:
     del gt
     gc.collect()
 
+    # labelled feature chunks spill to D: (runs/<id>/train_feats) -> GPU training streams them back
     run.start_stage("blocking+features_train")
-    chunks = []
+    fdir = run.dir / "train_feats"
+    shutil.rmtree(fdir, ignore_errors=True)
+    fdir.mkdir()
+    files, val_parts = [], []
+    n_pairs = n_pos = 0
+    pos_all = gt_use.drop_nulls()
     for c, part, pool_c, feats in iter_country_blocks("train", s1, cfg, run):
         ids = pool_c.select(pl.col("idx").alias("cand_idx"), pl.col("entity_id").alias("match_id"))
-        pos = (gt_use.drop_nulls().join(ids, on="match_id")
+        pos = (pos_all.join(ids, on="match_id")
                .select("s1_idx", "cand_idx").with_columns(pl.lit(1, pl.Int8).alias("label")))
-        chunks.append(feats.join(pos, on=["s1_idx", "cand_idx"], how="left")
-                      .with_columns(pl.col("label").fill_null(0)))
-    feats = pl.concat(chunks).join(idmap_s1.select("s1_idx", "is_val"), on="s1_idx")
-    del chunks
+        f = (feats.join(pos, on=["s1_idx", "cand_idx"], how="left").with_columns(pl.col("label").fill_null(0))
+             .join(idmap_s1.select("s1_idx", "is_val"), on="s1_idx"))
+        n_pairs += f.height
+        n_pos += int(f["label"].sum())
+        val_parts.append(f.filter(pl.col("is_val")))
+        files.append(fdir / f"part-{len(files):05d}.parquet")
+        f.write_parquet(files[-1])
+        del f, feats
+    va = pl.concat(val_parts)
+    del val_parts
     gc.collect()
     run.end_stage()
 
     tv = truth_counts.filter(pl.col("is_val"))
-    br = float(feats.filter(pl.col("is_val"))["label"].sum() / max(tv["n_true"].sum(), 1))
-    avg_c = feats.filter(pl.col("is_val")).height / max(tv.height, 1)
-    zero_c = tv.height - feats.filter(pl.col("is_val"))["s1_idx"].n_unique()
+    br = float(va["label"].sum() / max(tv["n_true"].sum(), 1))
+    avg_c = va.height / max(tv.height, 1)
+    zero_c = tv.height - va["s1_idx"].n_unique()
     run.log(f"metric val block_recall={br:.4f} avg_cands={avg_c:.1f} s1_without_cands={zero_c:,} "
-            f"pos_rate={feats['label'].mean():.4f}")
+            f"pos_rate={n_pos / max(n_pairs, 1):.4f} train_pairs={n_pairs - va.height:,}")
     run.set_metrics(block_recall=round(br, 4), avg_candidates=round(avg_c, 2), val_s1_without_cands=zero_c,
-                    n_pairs=feats.height, n_s1=s1.height)
+                    n_pairs=n_pairs, n_s1=s1.height, n_val_s1=tv.height)
 
     run.start_stage("train_model")
-    tr, va = feats.filter(~pl.col("is_val")), feats.filter(pl.col("is_val"))
-    model = train_model(cfg, run, tr, va)
-    del tr
+    model = train_model(cfg, run, files, va)
     gc.collect()
     run.end_stage()
 
@@ -374,21 +412,25 @@ def _join_ids(sel: pl.DataFrame) -> pl.DataFrame:
             .group_by("s1_idx", maintain_order=True).agg(pl.col("cid").str.join(",").alias("ids")))
 
 
-def _check_id_file(path: Path, col: str, n_s1: int) -> list[str]:
-    """Light polars format check (the official validator holds every candidate id in Python sets -> OOM here)."""
-    df = pl.read_csv(path, separator="\t", quote_char=None, infer_schema=False)
-    issues = []
-    if df.columns != ["source1_entity_id", col]:
-        issues.append(f"header {df.columns}")
-    if df.height != n_s1 or df["source1_entity_id"].n_unique() != n_s1:
-        issues.append(f"rows {df.height} unique {df['source1_entity_id'].n_unique()} expected {n_s1}")
-    ids = df.select(pl.int_range(pl.len()).alias("r"), pl.col(col).str.split(",")).explode(col).drop_nulls()
-    ids = ids.filter(pl.col(col) != "")
-    if ids.filter(~pl.col(col).str.contains(r"^S[23]-")).height:
-        issues.append("non S2/S3 id")
-    if ids.height != ids.unique().height:
-        issues.append("duplicate id within a list")
-    return issues
+def _check_id_file(path: Path, col: str, n_s1: int, batch: int = 100_000) -> list[str]:
+    """Streamed per-row format check (the official validator, and any global unique over ~70M ids, OOM here)."""
+    issues, rows, s1_seen = set(), 0, []
+    lf = pl.scan_csv(path, separator="\t", quote_char=None, infer_schema=False)
+    if lf.collect_schema().names() != ["source1_entity_id", col]:
+        return [f"header {lf.collect_schema().names()}"]
+    for b in lf.collect_batches(chunk_size=batch):
+        rows += b.height
+        s1_seen.append(b["source1_entity_id"])
+        v = b[col].fill_null("")
+        if (~v.str.contains(r"^(S[23]-[^,]+(,S[23]-[^,]+)*)?$")).any():
+            issues.add("malformed list or non S2/S3 id")
+        lst = v.str.split(",")
+        if (lst.list.n_unique() != lst.list.len()).any():
+            issues.add("duplicate id within a list")
+    n_unique = pl.concat(s1_seen).n_unique()
+    if rows != n_s1 or n_unique != n_s1:
+        issues.add(f"rows {rows} unique {n_unique} expected {n_s1}")
+    return sorted(issues)
 
 
 def predict_stage(cfg: Config, run: Run, model_run_dir: Path) -> None:
@@ -501,6 +543,7 @@ def main() -> None:
     ap.add_argument("--team", default="team")
     ap.add_argument("--max-cands", type=int, default=40)
     ap.add_argument("--train-max-s1", type=int, default=150_000)
+    ap.add_argument("--val-max-s1", type=int, default=40_000)
     ap.add_argument("--max-df", type=int, default=150)
     ap.add_argument("--threshold", type=float, default=None)
     ap.add_argument("--prep-workers", type=int, default=6)
@@ -520,7 +563,7 @@ def main() -> None:
     cfg = Config(run_name=a.name or (f"dev{a.sample}" if a.sample < 1 else a.cmd), sample=a.sample)
     cfg.max_candidates = a.max_cands
     cfg.model, cfg.device, cfg.s1_chunk = a.model, a.device, a.s1_chunk
-    cfg.extra.update(train_max_s1=a.train_max_s1, max_df=a.max_df, threshold_override=a.threshold,
+    cfg.extra.update(train_max_s1=a.train_max_s1, val_max_s1=a.val_max_s1, max_df=a.max_df, threshold_override=a.threshold,
                      prep_workers=a.prep_workers)
     run = Run(cfg.run_name, cfg.to_dict())
     try:

@@ -7,6 +7,8 @@ Keys per record, each type hashed with its own seed -> u64 (no string concatenat
   p  name_core token prefixes [:4] (len>=5)  weight 0.5  (typo / suffix robustness)
   a  address tokens (len>=3)                 weight 0.4
   z  postcode                                weight 1.5
+  c  adjacent address token pairs            weight 0.8  (order-robust street/number combos)
+  x  first name token x address number       weight 1.0
 Keys with pool doc-freq > `max_df` are dropped (too common to be useful). Postings are CSR
 arrays (sorted kept keys -> offsets -> u32 candidate idx) filled in two chunked passes, so peak
 RAM is ~ kept postings x 4 bytes + kept keys x 20 bytes instead of one big string frame.
@@ -20,8 +22,9 @@ import math
 import numpy as np
 import polars as pl
 
-KEY_WEIGHTS = {"n": 1.0, "b": 1.0, "p": 0.5, "a": 0.4, "z": 1.5}
-_SEED = {"n": 11, "b": 23, "p": 37, "a": 53, "z": 71}
+KEY_WEIGHTS = {"n": 1.0, "b": 1.0, "p": 0.5, "a": 0.4, "z": 1.5, "c": 0.8, "x": 1.0}
+_SEED = {"n": 11, "b": 23, "p": 37, "a": 53, "z": 71, "c": 89, "x": 97}
+NUM = r"^\d+[a-z]?$"
 
 
 def _mk(frame: pl.DataFrame, expr: pl.Expr, typ: str) -> pl.DataFrame:
@@ -39,12 +42,20 @@ def build_keys(df: pl.DataFrame, id_col: str = "idx") -> pl.DataFrame:
                          .then(pl.col("t").shift(-1)).alias("t2")))
     addr = (base.select("idx", pl.col("addr").str.split(" ").alias("t")).explode("t")
             .filter(pl.col("t").str.len_chars() >= 3))
+    addr_all = (base.select("idx", pl.col("addr").str.split(" ").alias("t")).explode("t")
+                .filter(pl.col("t").str.len_chars() > 0)
+                .with_columns(pl.when(pl.col("idx").shift(-1) == pl.col("idx"))
+                              .then(pl.col("t").shift(-1)).alias("t2")))
+    first = tok.group_by("idx", maintain_order=True).agg(pl.col("t").first().alias("f"))
+    nums = addr_all.filter(pl.col("t").str.contains(NUM)).join(first, on="idx")
     parts = [
         _mk(tok.filter(pl.col("t").str.len_chars() >= 2), pl.col("t"), "n"),
         _mk(tok.filter(pl.col("t2").is_not_null()), pl.concat_str(["t", "t2"], separator=" "), "b"),
         _mk(tok.filter(pl.col("t").str.len_chars() >= 5), pl.col("t").str.slice(0, 4), "p"),
         _mk(addr, pl.col("t"), "a"),
         _mk(base.filter(pl.col("postcode") != ""), pl.col("postcode"), "z"),
+        _mk(addr_all.filter(pl.col("t2").is_not_null()), pl.concat_str(["t", "t2"], separator=" "), "c"),
+        _mk(nums, pl.concat_str(["f", "t"], separator=" "), "x"),
     ]
     # a key counted once per record; keep max weight if duplicated
     return pl.concat(parts).group_by("idx", "key").agg(pl.col("w").max())
