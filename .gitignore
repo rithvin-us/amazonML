@@ -1,0 +1,22 @@
+# Virtual Environments
+.venv/
+.venv311/
+venv/
+
+# Datasets and Cache
+student_resource/dataset/
+cache/
+.cache/
+tmp/
+output/
+runs/
+
+# Python cache & artifacts
+**/__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# System files
+.DS_Store
+Thumbs.db

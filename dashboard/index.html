@@ -1,0 +1,299 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Training Dashboard</title>
+<style>
+:root{--bg:#0f1115;--card:#171a21;--line:#262b36;--fg:#e6e6e6;--mute:#8a93a6;--acc:#4fc3f7;--ok:#66bb6a;--warn:#ffb74d;--bad:#ef5350}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--fg);font:14px/1.4 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif}
+header{position:sticky;top:0;z-index:5;background:#12151b;border-bottom:1px solid var(--line);padding:10px 16px;display:flex;flex-wrap:wrap;gap:12px;align-items:center}
+header h1{font-size:16px;margin:0;color:var(--acc)}
+select{background:var(--card);color:var(--fg);border:1px solid var(--line);border-radius:4px;padding:4px 6px}
+.badge{padding:2px 10px;border-radius:10px;font-weight:600;font-size:12px;text-transform:uppercase;background:#444}
+.badge.running{background:#0d47a1;color:#bbdefb}.badge.done{background:#1b5e20;color:#c8e6c9}.badge.failed{background:#b71c1c;color:#ffcdd2}
+.prog{flex:1 1 200px;min-width:160px;height:14px;background:var(--line);border-radius:7px;overflow:hidden;position:relative}
+.prog>div{height:100%;background:var(--acc);width:0;transition:width .5s}
+.prog>span{position:absolute;inset:0;text-align:center;font-size:11px;line-height:14px;color:#000;mix-blend-mode:screen}
+.kv{color:var(--mute)}.kv b{color:var(--fg);font-weight:600}
+#note{color:var(--mute);font-style:italic;flex-basis:100%}
+main{padding:14px 16px;display:grid;gap:14px;grid-template-columns:repeat(auto-fit,minmax(420px,1fr))}
+.cards{grid-column:1/-1;display:grid;gap:10px;grid-template-columns:repeat(auto-fit,minmax(140px,1fr))}
+.card{background:var(--card);border:1px solid var(--line);border-radius:8px;padding:10px 12px}
+.card .l{color:var(--mute);font-size:11px;text-transform:uppercase;letter-spacing:.04em}
+.card .v{font-size:20px;font-weight:600;margin-top:2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.panel{background:var(--card);border:1px solid var(--line);border-radius:8px;padding:10px 12px;min-width:0}
+.panel h2{font-size:13px;margin:0 0 8px;color:var(--acc);text-transform:uppercase;letter-spacing:.05em}
+.wide{grid-column:1/-1}
+canvas{width:100%;height:220px;display:block}
+table{border-collapse:collapse;width:100%;font-size:12px}
+th,td{text-align:left;padding:4px 6px;border-bottom:1px solid var(--line);vertical-align:top}
+th{color:var(--mute);font-weight:600}
+tr.hl td{color:var(--acc);font-weight:600}
+.tw{overflow:auto;max-height:420px}
+.bar{display:inline-block;height:8px;background:var(--acc);border-radius:2px;vertical-align:middle;margin-left:6px}
+.bar.b2{background:var(--ok)}
+.fi{display:grid;grid-template-columns:minmax(120px,40%) 1fr 70px;gap:4px 8px;font-size:12px;align-items:center}
+.fi .n{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.fi .t{height:10px;background:var(--line);border-radius:2px}.fi .t>div{height:100%;background:var(--acc);border-radius:2px}
+.fi .x{text-align:right;color:var(--mute)}
+pre{margin:0;background:#0b0d11;border:1px solid var(--line);border-radius:6px;padding:8px;height:360px;overflow:auto;font:12px/1.35 Consolas,"Courier New",monospace;white-space:pre-wrap;word-break:break-all}
+pre .m{color:var(--acc)}pre .e{color:var(--bad)}
+.ok{color:var(--ok)}.warn{color:var(--warn)}.bad{color:var(--bad)}
+#err{color:var(--bad);font-size:12px}
+</style>
+</head>
+<body>
+<header>
+  <h1>Training Dashboard</h1>
+  <select id="runSel"></select>
+  <span id="badge" class="badge">—</span>
+  <span class="kv">stage <b id="stage">—</b></span>
+  <div class="prog"><div id="progBar"></div><span id="progTxt">—</span></div>
+  <span class="kv">elapsed <b id="elapsed">—</b></span>
+  <span class="kv">ETA <b id="eta">—</b></span>
+  <span class="kv">updated <b id="updated">—</b></span>
+  <span id="err"></span>
+  <div id="note"></div>
+</header>
+<main>
+  <div class="cards">
+    <div class="card"><div class="l">CPU</div><div class="v" id="c_cpu">—</div></div>
+    <div class="card"><div class="l">CPU MHz</div><div class="v" id="c_mhz">—</div></div>
+    <div class="card"><div class="l">RAM</div><div class="v" id="c_ram">—</div></div>
+    <div class="card"><div class="l">GPU util</div><div class="v" id="c_gpu">—</div></div>
+    <div class="card"><div class="l">GPU temp</div><div class="v" id="c_temp">—</div></div>
+    <div class="card"><div class="l">GPU power</div><div class="v" id="c_pow">—</div></div>
+    <div class="card"><div class="l">GPU SM clock</div><div class="v" id="c_sm">—</div></div>
+    <div class="card"><div class="l">VRAM</div><div class="v" id="c_vram">—</div></div>
+    <div class="card"><div class="l">GPU throttle</div><div class="v" id="c_thr">—</div></div>
+  </div>
+  <div class="panel"><h2>Live GPU util % &amp; temp C (last 300 samples)</h2><canvas id="ch_live"></canvas></div>
+  <div class="panel"><h2>Run: CPU % &amp; RAM %</h2><canvas id="ch_cpu"></canvas></div>
+  <div class="panel"><h2>Run: GPU util % &amp; temp C</h2><canvas id="ch_gpu"></canvas></div>
+  <div class="panel"><h2>Run: GPU SM clock vs max (MHz)</h2><canvas id="ch_sm"></canvas></div>
+  <div class="panel"><h2>Run: CPU MHz</h2><canvas id="ch_mhz"></canvas></div>
+  <div class="panel"><h2>Metrics</h2><div class="tw"><table id="metrics"></table></div></div>
+  <div class="panel"><h2>Feature importance (top 20, gain)</h2><div id="fi" class="fi"></div></div>
+  <div class="panel wide"><h2>Leaderboard</h2><div class="tw"><table id="lb"></table></div></div>
+  <div class="panel wide"><h2>Log tail</h2><pre id="log">—</pre></div>
+</main>
+<script>
+"use strict";
+const $ = id => document.getElementById(id);
+const DASH = "—";
+let selectedRun = null;
+const live = [];
+const LIVE_MAX = 300;
+
+function esc(s){return String(s).replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));}
+function num(v){if(v===null||v===undefined||v==="")return null;const n=Number(v);return isFinite(n)?n:null;}
+function fmt(v,d){const n=num(v);return n===null?DASH:n.toFixed(d===undefined?1:d);}
+function hms(s){const n=num(s);if(n===null)return DASH;let t=Math.max(0,Math.round(n));const h=Math.floor(t/3600);t%=3600;const m=Math.floor(t/60);const x=t%60;return h+":"+String(m).padStart(2,"0")+":"+String(x).padStart(2,"0");}
+function show(v){if(v===null||v===undefined||v==="")return DASH;if(typeof v==="number")return Number.isInteger(v)?String(v):(Math.abs(v)<1e-3||Math.abs(v)>=1e6?v.toExponential(3):String(+v.toFixed(5)));return String(v);}
+
+/* ---------- line chart ---------- */
+function lineChart(canvas, series, opts){
+  opts = opts || {};
+  const dpr = window.devicePixelRatio || 1;
+  const W = canvas.clientWidth || 400, H = canvas.clientHeight || 220;
+  if (canvas.width !== Math.round(W*dpr) || canvas.height !== Math.round(H*dpr)) { canvas.width = Math.round(W*dpr); canvas.height = Math.round(H*dpr); }
+  const g = canvas.getContext("2d");
+  g.setTransform(dpr,0,0,dpr,0,0);
+  g.clearRect(0,0,W,H);
+  const L=48,R=10,T=22,B=24, pw=W-L-R, ph=H-T-B;
+  g.font = "11px system-ui,sans-serif";
+  let n = 0, lo = Infinity, hi = -Infinity;
+  for (const s of series){ n = Math.max(n, s.data.length); for (const v of s.data){ if (v!==null){ lo=Math.min(lo,v); hi=Math.max(hi,v);} } }
+  if (opts.fixed){ lo = opts.fixed[0]; hi = opts.fixed[1]; }
+  else if (lo===Infinity){ lo=0; hi=1; }
+  else { if (hi===lo){ hi+=1; lo-=1; } const pad=(hi-lo)*0.08; hi+=pad; lo = (lo>=0 && lo-pad<0) ? 0 : lo-pad; }
+  // grid + y labels
+  g.strokeStyle="#262b36"; g.fillStyle="#8a93a6"; g.lineWidth=1; g.textAlign="right"; g.textBaseline="middle";
+  const ticks=5;
+  for (let i=0;i<=ticks;i++){
+    const y=T+ph*i/ticks, v=hi-(hi-lo)*i/ticks;
+    g.beginPath(); g.moveTo(L,y+.5); g.lineTo(L+pw,y+.5); g.stroke();
+    g.fillText(Math.abs(hi-lo)>=20?v.toFixed(0):v.toFixed(1), L-6, y);
+  }
+  // axes
+  g.strokeStyle="#4a5160";
+  g.beginPath(); g.moveTo(L+.5,T); g.lineTo(L+.5,T+ph); g.lineTo(L+pw,T+ph+.5); g.stroke();
+  // x labels
+  const xl = opts.xlabels || [];
+  g.textAlign="center"; g.textBaseline="top"; g.fillStyle="#8a93a6";
+  if (n>1 && xl.length){ for (const i of [0, Math.floor((n-1)/2), n-1]){ const x=L+pw*i/(n-1); g.fillText(xl[i]||"", x, T+ph+5); } }
+  if (!n){ g.textAlign="center"; g.textBaseline="middle"; g.fillText("no data", L+pw/2, T+ph/2); }
+  // lines
+  for (const s of series){
+    g.strokeStyle=s.color; g.lineWidth=1.6; g.beginPath(); let pen=false;
+    const m=s.data.length;
+    for (let i=0;i<m;i++){
+      const v=s.data[i]; if (v===null){ pen=false; continue; }
+      const x = L + (n>1 ? pw*i/(n-1) : pw/2);
+      const y = T + ph*(1-(Math.min(hi,Math.max(lo,v))-lo)/(hi-lo));
+      if (pen) g.lineTo(x,y); else { g.moveTo(x,y); pen=true; }
+    }
+    g.stroke();
+  }
+  // legend
+  let lx=L+4; g.textAlign="left"; g.textBaseline="middle";
+  for (const s of series){
+    const last = [...s.data].reverse().find(v=>v!==null);
+    const label = s.label + (last!==undefined ? " ("+(Math.abs(last)>=100?last.toFixed(0):last.toFixed(1))+")" : "");
+    g.fillStyle=s.color; g.fillRect(lx, 7, 10, 3);
+    g.fillStyle="#e6e6e6"; g.fillText(label, lx+14, 9);
+    lx += g.measureText(label).width + 30;
+  }
+}
+
+function col(rows, k){ return rows.map(r => num(r[k])); }
+function timeLabels(rows){ return rows.map(r => { const t=String(r.time||""); const m=t.match(/(\d{2}:\d{2}:\d{2})/); return m?m[1]:t; }); }
+
+let lastState = null;
+function drawRunCharts(){
+  const hw = (lastState && lastState.hw) || [];
+  const xl = timeLabels(hw);
+  lineChart($("ch_cpu"), [{label:"CPU %",color:"#4fc3f7",data:col(hw,"cpu_pct")},{label:"RAM %",color:"#ba68c8",data:col(hw,"ram_pct")}], {fixed:[0,100],xlabels:xl});
+  lineChart($("ch_gpu"), [{label:"GPU util %",color:"#66bb6a",data:col(hw,"gpu_util")},{label:"GPU temp C",color:"#ff8a65",data:col(hw,"gpu_temp_c")}], {fixed:[0,100],xlabels:xl});
+  lineChart($("ch_sm"), [{label:"SM clock",color:"#4fc3f7",data:col(hw,"gpu_sm_clock")},{label:"SM max",color:"#8a93a6",data:col(hw,"gpu_sm_clock_max")}], {xlabels:xl});
+  lineChart($("ch_mhz"), [{label:"CPU MHz",color:"#ffd54f",data:col(hw,"cpu_freq_mhz")}], {xlabels:xl});
+}
+function drawLive(){
+  lineChart($("ch_live"), [{label:"GPU util %",color:"#66bb6a",data:live.map(r=>num(r.gpu_util))},{label:"GPU temp C",color:"#ff8a65",data:live.map(r=>num(r.gpu_temp_c))}], {fixed:[0,100],xlabels:live.map(r=>r._t)});
+}
+
+/* ---------- header ---------- */
+function renderHeader(st){
+  const s = st.status || {};
+  const b = $("badge"); const stt = s.state || DASH;
+  b.textContent = stt; b.className = "badge " + (["running","done","failed"].includes(stt)?stt:"");
+  $("stage").textContent = s.stage || DASH;
+  let p = num(s.pct);
+  if (p!==null && p<=1) p*=100;
+  $("progBar").style.width = (p===null?0:Math.min(100,Math.max(0,p)))+"%";
+  $("progTxt").textContent = p===null?DASH:p.toFixed(1)+"%";
+  $("elapsed").textContent = hms(s.total_elapsed_s!==undefined?s.total_elapsed_s:s.stage_elapsed_s);
+  $("eta").textContent = s.state==="running" ? hms(s.eta_s) : DASH;
+  $("updated").textContent = s.updated || DASH;
+  $("note").textContent = s.note || "";
+}
+
+function renderRunSel(st){
+  const sel = $("runSel");
+  const runs = st.runs || [];
+  const cur = Array.from(sel.options).map(o=>o.value).join("|");
+  if (cur !== runs.join("|")){
+    sel.innerHTML = runs.map(r=>'<option value="'+esc(r)+'">'+esc(r)+'</option>').join("");
+  }
+  if (st.run) sel.value = st.run;
+}
+
+/* ---------- metrics ---------- */
+const HL = new Set(["val_f05","block_recall","validator_pass"]);
+function renderMetrics(m){
+  const t = $("metrics");
+  if (!m || typeof m!=="object"){ t.innerHTML = "<tr><td>"+DASH+"</td></tr>"; return; }
+  let h = "<tr><th>key</th><th>value</th></tr>";
+  for (const [k,v] of Object.entries(m)){
+    let val;
+    if (v && typeof v==="object" && !Array.isArray(v)) val = Object.entries(v).map(([a,b])=>esc(a)+": "+esc(show(b))).join(" &middot; ");
+    else if (Array.isArray(v)) val = esc(v.map(show).join(", "));
+    else val = esc(show(v));
+    h += '<tr'+(HL.has(k)?' class="hl"':'')+'><td>'+esc(k)+'</td><td>'+val+'</td></tr>';
+  }
+  t.innerHTML = h;
+}
+
+/* ---------- leaderboard ---------- */
+function renderLB(rows){
+  const t = $("lb");
+  if (!rows || !rows.length){ t.innerHTML = "<tr><td>"+DASH+"</td></tr>"; return; }
+  rows = rows.slice().reverse();
+  const cols = Object.keys(rows[0]);
+  const mx = k => Math.max(1e-9, ...rows.map(r=>num(r[k])||0));
+  const mf = mx("val_f05"), ml = mx("lb_score");
+  let h = "<tr>"+cols.map(c=>"<th>"+esc(c)+"</th>").join("")+"</tr>";
+  for (const r of rows){
+    h += "<tr>"+cols.map(c=>{
+      const v = r[c]; const n = num(v);
+      let cell = (v===null||v===undefined||v==="") ? DASH : esc(v);
+      if ((c==="val_f05"||c==="lb_score") && n!==null){
+        const w = Math.round(60*n/(c==="val_f05"?mf:ml));
+        cell += '<span class="bar'+(c==="lb_score"?" b2":"")+'" style="width:'+Math.max(1,w)+'px"></span>';
+      }
+      return "<td>"+cell+"</td>";
+    }).join("")+"</tr>";
+  }
+  t.innerHTML = h;
+}
+
+/* ---------- feature importance ---------- */
+function renderFI(fi){
+  const el = $("fi");
+  if (!fi || typeof fi!=="object"){ el.innerHTML = "<div>"+DASH+"</div>"; return; }
+  let items = Array.isArray(fi) ? fi.map(x=>Array.isArray(x)?[x[0],num(x[1])]:[x.feature||x.name,num(x.importance||x.gain)]) : Object.entries(fi).map(([k,v])=>[k,num(v)]);
+  items = items.filter(x=>x[1]!==null).sort((a,b)=>b[1]-a[1]).slice(0,20);
+  if (!items.length){ el.innerHTML = "<div>"+DASH+"</div>"; return; }
+  const mxv = Math.max(1e-9, ...items.map(x=>x[1]));
+  el.innerHTML = items.map(([k,v])=>'<div class="n" title="'+esc(k)+'">'+esc(k)+'</div><div class="t"><div style="width:'+(100*Math.max(0,v)/mxv).toFixed(1)+'%"></div></div><div class="x">'+esc(show(v))+'</div>').join("");
+}
+
+/* ---------- log ---------- */
+function renderLog(txt){
+  const el = $("log");
+  if (!txt){ el.textContent = DASH; return; }
+  el.innerHTML = txt.replace(/\n$/,"").split("\n").map(l=>{
+    const e = esc(l);
+    if (/FAILED|Error|Traceback/.test(l)) return '<span class="e">'+e+'</span>';
+    if (/metric/i.test(l)) return '<span class="m">'+e+'</span>';
+    return e;
+  }).join("\n");
+  el.scrollTop = el.scrollHeight;
+}
+
+/* ---------- live cards ---------- */
+function renderHW(h){
+  if (!h || h.error){ $("err").textContent = h && h.error ? "hw: "+h.error : ""; return; }
+  $("err").textContent = "";
+  $("c_cpu").textContent = fmt(h.cpu_pct)+" %";
+  $("c_mhz").textContent = fmt(h.cpu_freq_mhz,0);
+  $("c_ram").textContent = fmt(h.ram_used_gb)+" GB / "+fmt(h.ram_pct,0)+"%";
+  $("c_gpu").textContent = fmt(h.gpu_util,0)+" %";
+  $("c_temp").textContent = fmt(h.gpu_temp_c,0)+" C";
+  $("c_pow").textContent = fmt(h.gpu_power_w)+" W";
+  $("c_sm").textContent = fmt(h.gpu_sm_clock,0)+" / "+fmt(h.gpu_sm_clock_max,0);
+  $("c_vram").textContent = fmt(h.gpu_mem_used_mb,0)+" / "+fmt(h.gpu_mem_total_mb,0)+" MB";
+  const thr = (h.gpu_throttle===null||h.gpu_throttle===undefined||h.gpu_throttle==="") ? DASH : String(h.gpu_throttle);
+  const tl = thr.toLowerCase();
+  const c = $("c_thr"); c.textContent = thr; c.title = thr;
+  c.className = "v " + (/thermal|hw_/.test(tl) ? "bad" : /power/.test(tl) ? "warn" : /none/.test(tl) ? "ok" : "");
+}
+
+/* ---------- polling ---------- */
+async function pollState(){
+  try{
+    const r = await fetch("/api/state"+(selectedRun?"?run="+encodeURIComponent(selectedRun):""), {cache:"no-store"});
+    const st = await r.json();
+    lastState = st;
+    renderRunSel(st); renderHeader(st); renderMetrics(st.metrics); renderLB(st.leaderboard); renderFI(st.feature_importance); renderLog(st.log_tail);
+    drawRunCharts();
+  }catch(e){ $("err").textContent = "state: "+e; }
+}
+async function pollHW(){
+  try{
+    const r = await fetch("/api/hw_now", {cache:"no-store"});
+    const h = await r.json();
+    renderHW(h);
+    if (h && !h.error){ h._t = new Date().toTimeString().slice(0,8); live.push(h); if (live.length>LIVE_MAX) live.shift(); drawLive(); }
+  }catch(e){ $("err").textContent = "hw: "+e; }
+}
+$("runSel").addEventListener("change", e => { selectedRun = e.target.value || null; pollState(); });
+window.addEventListener("resize", () => { drawRunCharts(); drawLive(); });
+pollState(); pollHW();
+setInterval(pollState, 3000);
+setInterval(pollHW, 2000);
+</script>
+</body>
+</html>
