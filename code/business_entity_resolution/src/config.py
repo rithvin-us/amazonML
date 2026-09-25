@@ -6,7 +6,7 @@ import tempfile
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
 
-# Project root = D:\amazon-ml (four levels up from this file), overridable with ER_ROOT.
+# Project root (four levels up from this file), overridable with ER_ROOT.
 ROOT = Path(os.environ.get("ER_ROOT", Path(__file__).resolve().parents[3]))
 DATA_DIR = Path(os.environ.get("ER_DATA", ROOT / "student_resource" / "dataset"))
 CACHE_DIR = ROOT / "cache"
@@ -16,7 +16,7 @@ TMP_DIR = ROOT / "tmp"
 LOCAL_CACHE = ROOT / ".cache"
 VALIDATOR = ROOT / "student_resource" / "utils" / "validate_submission.py"
 
-# Keep every temp/cache write on the project drive (C: is full). Child processes inherit these.
+# Keep temp/cache writes under the project directory. Child processes inherit these.
 _ENV_DIRS = {
     "TMP": TMP_DIR, "TEMP": TMP_DIR, "TMPDIR": TMP_DIR, "POLARS_TEMP_DIR": TMP_DIR / "polars",
     "CUDA_CACHE_PATH": LOCAL_CACHE / "nv", "XDG_CACHE_HOME": LOCAL_CACHE, "HF_HOME": LOCAL_CACHE / "hf",

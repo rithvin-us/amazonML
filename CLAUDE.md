@@ -10,11 +10,11 @@ Rules: no external lookups/APIs/geocoding; final model MIT/Apache ≤8B; `countr
 - `code/business_entity_resolution/src/` — pipeline (entry: `pipeline.py`)
 - `cache/` parquet caches · `runs/<run_id>/` run registry · `output/` submission TSVs
 - `notebooks/dashboard.ipynb` — human UI over runs/ + hardware
-- Python: `.venv311\Scripts\python.exe` (3.11). Old `.venv` (3.14) unused.
+- Python: `python3` (3.11+). On Windows: `.venv311\Scripts\python.exe`.
 
 ## Commands (run from repo root)
 ```
-PY=.venv311/Scripts/python.exe; SRC=code/business_entity_resolution/src
+PY=python3; SRC=code/business_entity_resolution/src
 $PY $SRC/profile_data.py                 # aggregate stats -> runs/profile.json
 $PY $SRC/pipeline.py all --sample 0.02   # dev run
 $PY $SRC/pipeline.py all                 # full run (train+val+test+validate)

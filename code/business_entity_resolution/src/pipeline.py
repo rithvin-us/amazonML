@@ -459,15 +459,16 @@ def predict_stage(cfg: Config, run: Run, model_run_dir: Path) -> None:
     test_dir = ROOT / "student_resource" / "dataset" / "test"
     ok = True
     report = []
+    cand_path = OUTPUT_DIR / "candidate_pairs.tsv"
     for fn in ("matching_results.tsv", "variants/matching_results_excl.tsv"):
-        r = subprocess.run([sys.executable, str(VALIDATOR), "--matching", str(OUTPUT_DIR / fn),
-                            "--test-dir", str(test_dir)],
-                           capture_output=True, text=True, encoding="utf-8", errors="replace")
+        cmd = [sys.executable, str(VALIDATOR), "--matching", str(OUTPUT_DIR / fn),
+               "--candidate", str(cand_path), "--test-dir", str(test_dir)]
+        r = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace")
         report.append(f"== {fn}\n{r.stdout}{r.stderr}")
         tail = (r.stdout.strip().splitlines() or [r.stderr[-300:]])[-1]
         run.log(f"metric validator {fn} exit={r.returncode}: {tail}")
         ok &= r.returncode == 0
-    cand_issues = _check_id_file(OUTPUT_DIR / "candidate_pairs.tsv", "candidate_entity_ids", n_s1)
+    cand_issues = _check_id_file(cand_path, "candidate_entity_ids", n_s1)
     report.append(f"== candidate_pairs.tsv (polars check)\n{cand_issues or 'OK'}")
     run.log(f"metric candidate_pairs check: {cand_issues or 'OK'}")
     (run.dir / "validate.txt").write_text("\n".join(report), encoding="utf-8")
