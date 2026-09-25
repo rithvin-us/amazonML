@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+import tempfile
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
 
@@ -11,7 +12,20 @@ DATA_DIR = Path(os.environ.get("ER_DATA", ROOT / "student_resource" / "dataset")
 CACHE_DIR = ROOT / "cache"
 RUNS_DIR = ROOT / "runs"
 OUTPUT_DIR = ROOT / "output"
+TMP_DIR = ROOT / "tmp"
+LOCAL_CACHE = ROOT / ".cache"
 VALIDATOR = ROOT / "student_resource" / "utils" / "validate_submission.py"
+
+# Keep every temp/cache write on the project drive (C: is full). Child processes inherit these.
+_ENV_DIRS = {
+    "TMP": TMP_DIR, "TEMP": TMP_DIR, "TMPDIR": TMP_DIR, "POLARS_TEMP_DIR": TMP_DIR / "polars",
+    "CUDA_CACHE_PATH": LOCAL_CACHE / "nv", "XDG_CACHE_HOME": LOCAL_CACHE, "HF_HOME": LOCAL_CACHE / "hf",
+    "TORCH_HOME": LOCAL_CACHE / "torch", "PIP_CACHE_DIR": LOCAL_CACHE / "pip", "MPLCONFIGDIR": LOCAL_CACHE / "mpl",
+}
+for _k, _v in _ENV_DIRS.items():
+    _v.mkdir(parents=True, exist_ok=True)
+    os.environ[_k] = str(_v)
+tempfile.tempdir = str(TMP_DIR)
 
 
 @dataclass
@@ -26,12 +40,17 @@ class Config:
     max_candidates: int = 60       # hard cap after union
     tfidf_min_sim: float = 0.2
     chunk_size: int = 2000
+    s1_chunk: int = 20_000         # S1 rows featurised per step (bounds peak RAM)
     # model
-    lgb_rounds: int = 600
-    lgb_lr: float = 0.05
+    model: str = "xgb"             # xgb (GPU-capable) | lgb
+    device: str = "cuda"           # xgb device; falls back to cpu if CUDA init fails
+    rounds: int = 2000
+    lr: float = 0.05
+    xgb_depth: int = 8
     lgb_leaves: int = 63
     neg_per_pos_cap: int = 0       # 0 = keep all negatives
     threshold: float = 0.5         # overwritten by tuning
+    p_floor: float = 0.02          # test pairs below this are never kept for the decision stage
     n_jobs: int = max(1, (os.cpu_count() or 4) - 2)
     extra: dict = field(default_factory=dict)
 

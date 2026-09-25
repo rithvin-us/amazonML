@@ -74,6 +74,7 @@ pre .m{color:var(--acc)}pre .e{color:var(--bad)}
   <div class="panel"><h2>Run: GPU util % &amp; temp C</h2><canvas id="ch_gpu"></canvas></div>
   <div class="panel"><h2>Run: GPU SM clock vs max (MHz)</h2><canvas id="ch_sm"></canvas></div>
   <div class="panel"><h2>Run: CPU MHz</h2><canvas id="ch_mhz"></canvas></div>
+  <div class="panel"><h2>Training curve: logloss (train/val) &amp; val AUC-PR</h2><canvas id="ch_curve"></canvas></div>
   <div class="panel"><h2>Metrics</h2><div class="tw"><table id="metrics"></table></div></div>
   <div class="panel"><h2>Feature importance (top 20, gain)</h2><div id="fi" class="fi"></div></div>
   <div class="panel wide"><h2>Leaderboard</h2><div class="tw"><table id="lb"></table></div></div>
@@ -159,6 +160,8 @@ function drawRunCharts(){
   lineChart($("ch_gpu"), [{label:"GPU util %",color:"#66bb6a",data:col(hw,"gpu_util")},{label:"GPU temp C",color:"#ff8a65",data:col(hw,"gpu_temp_c")}], {fixed:[0,100],xlabels:xl});
   lineChart($("ch_sm"), [{label:"SM clock",color:"#4fc3f7",data:col(hw,"gpu_sm_clock")},{label:"SM max",color:"#8a93a6",data:col(hw,"gpu_sm_clock_max")}], {xlabels:xl});
   lineChart($("ch_mhz"), [{label:"CPU MHz",color:"#ffd54f",data:col(hw,"cpu_freq_mhz")}], {xlabels:xl});
+  const curve = (lastState && lastState.curve) || [];
+  lineChart($("ch_curve"), [{label:"train logloss",color:"#4fc3f7",data:col(curve,"train_logloss")},{label:"val logloss",color:"#ffb74d",data:col(curve,"val_logloss")},{label:"val AUC-PR",color:"#66bb6a",data:col(curve,"val_aucpr")}], {xlabels:curve.map(r=>r.iter)});
 }
 function drawLive(){
   lineChart($("ch_live"), [{label:"GPU util %",color:"#66bb6a",data:live.map(r=>num(r.gpu_util))},{label:"GPU temp C",color:"#ff8a65",data:live.map(r=>num(r.gpu_temp_c))}], {fixed:[0,100],xlabels:live.map(r=>r._t)});
