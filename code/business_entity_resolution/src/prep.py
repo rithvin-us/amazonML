@@ -14,24 +14,27 @@ from multiprocessing import Pool
 import polars as pl
 import pyarrow.parquet as pq
 
+import indic
 import normalize as nz
-from config import CACHE_DIR
+from config import CACHE_DIR, NORM_VERSION
 from io_utils import load_source
 
 
 def _norm_chunk(args):
     names, addrs = args
     nn = [nz.norm_name(x) for x in names]
+    addrs = [x or "" for x in addrs]
     aa = [nz.norm_addr(x) for x in addrs]
-    return ([n[0] for n in nn], [n[1] for n in nn], aa,
+    return ([n[0] for n in nn], [n[1] for n in nn], [n[2] for n in nn], aa,
             [nz.postcode(x) for x in addrs], [nz.numbers(a) for a in aa])
 
 
 def norm_dir(split: str, kind: str):
-    return CACHE_DIR / f"norm_{split}_{kind}"
+    return CACHE_DIR / f"norm_{split}_{kind}_{NORM_VERSION}"
 
 
 def prep(split: str, workers: int = 6, batch: int = 200_000) -> None:
+    indic.ensure_dict()  # learned from train GT; must exist before workers import normalize
     for kind in ("s1", "pool"):
         out = norm_dir(split, kind)
         if (out / "_DONE").exists():
@@ -53,15 +56,15 @@ def prep(split: str, workers: int = 6, batch: int = 200_000) -> None:
                     names, addrs = df["business_name"].to_list(), df["business_address"].to_list()
                     step = 10_000
                     jobs = [(names[i:i + step], addrs[i:i + step]) for i in range(0, len(names), step)]
-                    cols = [[], [], [], [], []]
+                    cols = [[], [], [], [], [], []]
                     for res in p.imap(_norm_chunk, jobs):
                         for c, r in zip(cols, res):
                             c.extend(r)
                     df = df.select(
                         (pl.int_range(pl.len(), dtype=pl.Int64) + offset).alias("idx"), "entity_id",
                         pl.Series("name_full", cols[0]), pl.Series("name_core", cols[1]),
-                        pl.Series("addr", cols[2]), pl.Series("postcode", cols[3]),
-                        pl.Series("addr_nums", cols[4]),
+                        pl.Series("name_skel", cols[2]), pl.Series("addr", cols[3]),
+                        pl.Series("postcode", cols[4]), pl.Series("addr_nums", cols[5]),
                         pl.col("country").str.strip_chars().str.to_lowercase().alias("country_n"),
                         pl.lit(tag).alias("src"))
                     df.write_parquet(out / f"part-{part:04d}.parquet")

@@ -15,6 +15,7 @@ OUTPUT_DIR = ROOT / "output"
 TMP_DIR = ROOT / "tmp"
 LOCAL_CACHE = ROOT / ".cache"
 VALIDATOR = ROOT / "student_resource" / "utils" / "validate_submission.py"
+NORM_VERSION = "v3"  # bump when normalize.py output changes -> fresh cache/norm_<split>_<kind>_<ver>
 
 # Keep every temp/cache write on the project drive (C: is full). Child processes inherit these.
 _ENV_DIRS = {
@@ -43,7 +44,7 @@ class Config:
     s1_chunk: int = 20_000         # S1 rows featurised per step (bounds peak RAM)
     # model
     model: str = "xgb"             # xgb (GPU-capable) | lgb
-    xgb_rounds: int = 2000
+    xgb_rounds: int = 4000
     xgb_lr: float = 0.05
     xgb_depth: int = 8
     xgb_early_stop: int = 100

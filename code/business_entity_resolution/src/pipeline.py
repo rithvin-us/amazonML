@@ -26,8 +26,8 @@ import polars as pl
 import psutil
 
 from blocking import BlockIndex
-from config import CACHE_DIR, OUTPUT_DIR, ROOT, RUNS_DIR, VALIDATOR, Config
-from features import FEATURES, TEXT_COLS, build_features
+from config import CACHE_DIR, NORM_VERSION, OUTPUT_DIR, ROOT, RUNS_DIR, VALIDATOR, Config
+from features import FEATURES, TEXT_COLS, add_name_counts, build_features
 from hwmon import HwMonitor
 from io_utils import load_ground_truth
 from tracking import Run, record_lb_score
@@ -45,13 +45,13 @@ def avail_gb() -> float:
 
 # ---------------------------------------------------------------- prep (streamed, separate process)
 def norm_dir(split: str, kind: str) -> Path:
-    return CACHE_DIR / f"norm_{split}_{kind}"
+    return CACHE_DIR / f"norm_{split}_{kind}_{NORM_VERSION}"
 
 
 def prep(split: str, run: Run, cfg: Config) -> None:
     """Runs prep.py in a child process (light imports -> small multiprocessing workers)."""
     if all((norm_dir(split, k) / "_DONE").exists() for k in ("s1", "pool")):
-        run.log(f"cache hit norm_{split}_*")
+        run.log(f"cache hit norm_{split}_*_{NORM_VERSION}")
         return
     workers = cfg.extra.get("prep_workers", 6)
     proc = subprocess.Popen([sys.executable, str(SRC_DIR / "prep.py"), split, "--workers", str(workers)],
@@ -84,6 +84,7 @@ def iter_country_blocks(split: str, s1_all: pl.DataFrame, cfg: Config, run: Run)
     for c in cs:
         s1_c = s1_all.filter(pl.col("country_n") == c)
         pool_c = scan_norm(split, "pool").filter(pl.col("country_n") == c).select(NORM_COLS).collect()
+        s1_c, pool_c = add_name_counts([s1_c, pool_c], pool_c, scan_norm(split, "s1").filter(pl.col("country_n") == c))
         run.log(f"[{c}] S1 {s1_c.height:,}  pool {pool_c.height:,}: building index (RAM avail {avail_gb():.1f}GB)")
         index = BlockIndex(pool_c, max_df=cfg.extra.get("max_df", 150),
                            chunk=cfg.extra.get("index_chunk", 100_000))  # smaller key-build batches = lower peak RAM
@@ -91,12 +92,13 @@ def iter_country_blocks(split: str, s1_all: pl.DataFrame, cfg: Config, run: Run)
                 f" (RAM avail {avail_gb():.1f}GB)")
         for i in range(0, s1_c.height, cfg.s1_chunk):
             part = s1_c.slice(i, cfg.s1_chunk)
-            pairs = index.query(part, top_k=cfg.max_candidates, chunk=cfg.chunk_size)
+            pairs = index.query(part, top_k=cfg.max_candidates, chunk=cfg.chunk_size,
+                                k_name=cfg.extra.get("k_name", 10), k_addr=cfg.extra.get("k_addr", 5))
             feats = build_features(pairs, part, pool_c, workers=cfg.n_jobs)
             done += part.height
             run.progress(done / n_all, f"[{c}] {done:,}/{n_all:,} S1 blocked+featurised")
             yield c, part, pool_c, feats
-        del index, pool_c
+        del index, pool_c, s1_c
         gc.collect()
 
 
@@ -161,11 +163,11 @@ class Curve:
 
 
 def _train_parts(files: list[Path]) -> pl.DataFrame:
-    return pl.concat([pl.read_parquet(f).filter(~pl.col("is_val")) for f in files])
+    return pl.concat([pl.read_parquet(f).filter(~pl.col("is_val") & ~pl.col("is_es")) for f in files])
 
 
 def train_model(cfg: Config, run: Run, train_files: list[Path], va: pl.DataFrame) -> Model:
-    """train_files: per-chunk feature parquet on D: (is_val rows skipped); va: in-RAM validation frame."""
+    """train_files: per-chunk feature parquet on D: (val / early-stop rows skipped); va: in-RAM early-stop frame."""
     Xva, yva = va.select(FEATURES).to_numpy(), va["label"].to_numpy()
     curve = Curve(run.dir / "train_curve.csv")
     if cfg.model == "xgb":
@@ -182,7 +184,7 @@ def train_model(cfg: Config, run: Run, train_files: list[Path], va: pl.DataFrame
             def next(self, input_data) -> bool:
                 if self.i == len(train_files):
                     return False
-                df = pl.read_parquet(train_files[self.i]).filter(~pl.col("is_val"))
+                df = pl.read_parquet(train_files[self.i]).filter(~pl.col("is_val") & ~pl.col("is_es"))
                 input_data(data=df.select(FEATURES).to_numpy(), label=df["label"].to_numpy(),
                            feature_names=FEATURES)
                 self.i += 1
@@ -311,21 +313,54 @@ def tune_decision(scored: pl.DataFrame, truth_counts: pl.DataFrame, floor: float
 
 
 # ---------------------------------------------------------------- train
+def s1_blocks(split: str, max_size: int = 2000) -> pl.DataFrame:
+    """entity_id -> block = country | city (2nd-to-last comma part of raw S1 address, digits dropped) | name_core[:1].
+
+    Blocks over max_size are split by name_core[:3]. Validation samples whole blocks so sibling S1s (chains,
+    duplicates) competing for the same pool records are co-present, as on test; stage 2 computes its
+    competition features within blocks on both val and test.
+    """
+    raw = pl.scan_parquet(CACHE_DIR / f"raw_{split}_s1.parquet").select(
+        "entity_id", pl.col("business_address").fill_null("").str.split(",")
+        .list.eval(pl.element().str.to_lowercase().str.replace_all(r"\d+", "").str.strip_chars())
+        .list.get(-2, null_on_oob=True).fill_null("").alias("city"))
+    key = lambda n: pl.concat_str([pl.col("country_n"), pl.col("city"), pl.col("name_core").str.slice(0, n)],  # noqa: E731
+                                  separator="|")
+    return (scan_norm(split, "s1").select("entity_id", "country_n", "name_core")
+            .join(raw, on="entity_id", how="left").with_columns(pl.col("city").fill_null(""))
+            .with_columns(key(1).alias("b1"))
+            .select("entity_id", "country_n",
+                    pl.when(pl.len().over("b1") > max_size).then(key(3)).otherwise(pl.col("b1")).alias("block"))
+            .collect())
+
+
 def train_stage(cfg: Config, run: Run) -> None:
     run.start_stage("prep_train")
     prep("train", run, cfg)
     run.end_stage()
 
     gt = load_ground_truth()
-    s1_ids = scan_norm("train", "s1").select("entity_id").collect()["entity_id"]
-    n_use = min(int(s1_ids.len() * cfg.sample), cfg.extra.get("train_max_s1", 150_000))
-    use = s1_ids.sample(n=n_use, seed=cfg.seed, shuffle=True)
-    val_ids = use.head(min(int(n_use * cfg.val_frac), cfg.extra.get("val_max_s1", 40_000)))
+    blk = s1_blocks("train")
+    n_use = min(int(blk.height * cfg.sample), cfg.extra.get("train_max_s1", 150_000))
+    n_val = min(int(n_use * cfg.val_frac), cfg.extra.get("val_max_s1", 40_000))
+    # val = whole blocks (random order, huge metro blocks skipped) until n_val; train = random from the rest
+    bl = (blk.group_by("block").len().filter(pl.col("len") <= cfg.extra.get("val_block_max", 2000))
+          .sort("block").sample(fraction=1.0, shuffle=True, seed=cfg.seed)
+          .filter(pl.col("len").cum_sum() <= n_val))
+    val_ids = blk.join(bl.select("block"), on="block", how="semi")["entity_id"]
+    rest = blk.join(bl.select("block"), on="block", how="anti")["entity_id"]
+    use = pl.concat([val_ids, rest.sample(n=min(n_use - val_ids.len(), rest.len()), seed=cfg.seed, shuffle=True)])
+    blk = blk.join(bl.select("block"), on="block", how="semi")  # keep only val rows (for val_truth.parquet)
+    del rest
+    # is_es: ~5% of the non-val train S1 held out for early stopping (val stays untouched by model selection)
     s1 = (scan_norm("train", "s1").filter(pl.col("entity_id").is_in(use.implode())).select(NORM_COLS)
-          .collect().with_columns(pl.col("entity_id").is_in(val_ids.implode()).alias("is_val")))
-    run.log(f"S1 used {s1.height:,} (val {val_ids.len():,})")
+          .collect().with_columns(pl.col("entity_id").is_in(val_ids.implode()).alias("is_val"))
+          .with_columns((~pl.col("is_val") & (pl.col("entity_id").hash(cfg.seed) % 20 == 0)).alias("is_es")))
+    mix = lambda f: dict(s1.filter(f).group_by("country_n").len().sort("country_n").iter_rows())  # noqa: E731
+    run.log(f"S1 used {s1.height:,} (val {val_ids.len():,} in {bl.height:,} blocks, es {int(s1['is_es'].sum()):,}) "
+            f"country mix val={mix(pl.col('is_val'))} train={mix(~pl.col('is_val'))}")
 
-    idmap_s1 = s1.select(pl.col("idx").alias("s1_idx"), pl.col("entity_id").alias("s1_id"), "is_val")
+    idmap_s1 = s1.select(pl.col("idx").alias("s1_idx"), pl.col("entity_id").alias("s1_id"), "is_val", "is_es")
     gt_use = gt.join(idmap_s1, on="s1_id")
     truth_counts = (idmap_s1.join(gt_use.group_by("s1_id").agg(pl.col("match_id").drop_nulls().len().alias("n_true")),
                                   on="s1_id", how="left").fill_null(0))
@@ -337,7 +372,7 @@ def train_stage(cfg: Config, run: Run) -> None:
     fdir = run.dir / "train_feats"
     shutil.rmtree(fdir, ignore_errors=True)
     fdir.mkdir()
-    files, val_parts = [], []
+    files, val_parts, es_parts = [], [], []
     n_pairs = n_pos = 0
     pos_all = gt_use.drop_nulls()
     for c, part, pool_c, feats in iter_country_blocks("train", s1, cfg, run):
@@ -345,15 +380,16 @@ def train_stage(cfg: Config, run: Run) -> None:
         pos = (pos_all.join(ids, on="match_id")
                .select("s1_idx", "cand_idx").with_columns(pl.lit(1, pl.Int8).alias("label")))
         f = (feats.join(pos, on=["s1_idx", "cand_idx"], how="left").with_columns(pl.col("label").fill_null(0))
-             .join(idmap_s1.select("s1_idx", "is_val"), on="s1_idx"))
+             .join(idmap_s1.select("s1_idx", "is_val", "is_es"), on="s1_idx"))
         n_pairs += f.height
         n_pos += int(f["label"].sum())
         val_parts.append(f.filter(pl.col("is_val")))
+        es_parts.append(f.filter(pl.col("is_es")))
         files.append(fdir / f"part-{len(files):05d}.parquet")
         f.write_parquet(files[-1])
         del f, feats
-    va = pl.concat(val_parts)
-    del val_parts
+    va, es = pl.concat(val_parts), pl.concat(es_parts)
+    del val_parts, es_parts
     gc.collect()
     run.end_stage()
 
@@ -367,7 +403,8 @@ def train_stage(cfg: Config, run: Run) -> None:
                     n_pairs=n_pairs, n_s1=s1.height, n_val_s1=tv.height)
 
     run.start_stage("train_model")
-    model = train_model(cfg, run, files, va)
+    model = train_model(cfg, run, files, es)
+    del es
     gc.collect()
     run.end_stage()
 
@@ -376,6 +413,8 @@ def train_stage(cfg: Config, run: Run) -> None:
         pl.Series("p", model.predict(va.select(FEATURES).to_numpy()), dtype=pl.Float32))
     va.write_parquet(run.dir / "val_scored.parquet")  # for offline error analysis / re-decisions
     tvc = tv.select("s1_idx", "n_true")
+    (tv.select("s1_idx", "s1_id", "n_true").join(blk.rename({"entity_id": "s1_id"}), on="s1_id", how="left")
+     .write_parquet(run.dir / "val_truth.parquet"))  # stage 2 (post-hoc) needs every val S1 incl. no-cand ones
     res = tune_decision(va, tvc, cfg.p_floor, run)
     dec = max(res.values(), key=lambda d: d["f05"])
     ex = eval_selection(exclusive(apply_decision(va, dec, cfg.p_floor)), tvc)
@@ -535,7 +574,7 @@ def submit_stage(run_dir: Path, team: str) -> Path:
 # ---------------------------------------------------------------- main
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("cmd", choices=["prep", "train", "predict", "all", "submit", "lb"])
+    ap.add_argument("cmd", choices=["prep", "train", "predict", "all", "submit", "lb", "stage2"])
     ap.add_argument("args", nargs="*")
     ap.add_argument("--sample", type=float, default=1.0)
     ap.add_argument("--name", default=None)
@@ -550,6 +589,10 @@ def main() -> None:
     ap.add_argument("--model", choices=["xgb", "lgb"], default="xgb")
     ap.add_argument("--device", choices=["cuda", "cpu"], default="cuda")
     ap.add_argument("--s1-chunk", type=int, default=20_000)
+    ap.add_argument("--k-name", type=int, default=10, help="extra candidates kept by name-key score rank")
+    ap.add_argument("--k-addr", type=int, default=5, help="extra candidates kept by address-key score rank")
+    ap.add_argument("--rounds", type=int, default=None, help="override xgb_rounds")
+    ap.add_argument("--promote", action="store_true", help="stage2: also write output/matching_results.tsv")
     a = ap.parse_args()
 
     if a.cmd == "lb":
@@ -560,11 +603,14 @@ def main() -> None:
         submit_stage(RUNS_DIR / a.run, a.team)
         return
 
-    cfg = Config(run_name=a.name or (f"dev{a.sample}" if a.sample < 1 else a.cmd), sample=a.sample)
+    cfg = Config(run_name=a.name or (f"s2_{a.run}" if a.cmd == "stage2" else f"dev{a.sample}" if a.sample < 1 else a.cmd),
+                 sample=a.sample)
     cfg.max_candidates = a.max_cands
     cfg.model, cfg.device, cfg.s1_chunk = a.model, a.device, a.s1_chunk
+    if a.rounds:
+        cfg.xgb_rounds = a.rounds
     cfg.extra.update(train_max_s1=a.train_max_s1, val_max_s1=a.val_max_s1, max_df=a.max_df, threshold_override=a.threshold,
-                     prep_workers=a.prep_workers)
+                     prep_workers=a.prep_workers, k_name=a.k_name, k_addr=a.k_addr)
     run = Run(cfg.run_name, cfg.to_dict())
     try:
         with HwMonitor(run.dir / "hw.csv"):
@@ -580,6 +626,10 @@ def main() -> None:
                 predict_stage(cfg, run, RUNS_DIR / a.run)
             if a.cmd == "all":
                 predict_stage(cfg, run, run.dir)
+            if a.cmd == "stage2":
+                from stage2 import run_stage2
+                run_stage2(RUNS_DIR / a.run, run, device=cfg.device, seed=cfg.seed, workers=cfg.n_jobs,
+                           promote=a.promote)
         m = run.metrics
         run.finish(cfg.sample, notes=f"{m.get('model', '')}/{m.get('device', '')} {m.get('decision_mode', '')}:"
                                      f"{m.get('decision_param', '')}")
