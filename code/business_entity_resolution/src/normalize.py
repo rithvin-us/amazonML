@@ -105,10 +105,16 @@ def _tokens(s: str) -> list[str]:
     return _WS.sub(" ", s).strip().split()
 
 
+_LOOK = {"0": "o", "1": "l", "3": "e", "4": "a", "5": "s", "6": "g", "7": "t", "8": "b"}
+# a look-alike digit that starts a word (5atguru, 8ashaw) or sits between letters (cu1tural); trailing numbers
+# (shop15) and pure numbers (super 50) are real and stay
+_LOOK_RE = re.compile(r"(?:^|(?<=[a-z]))[013-8](?=[a-z])")
+
+
 def _unleet(t: str) -> str:
-    """cu1tural -> cultural, uni0n -> union (digit-for-letter noise inside alphabetic tokens)."""
-    if ("0" in t or "1" in t) and _LEET.match(t) and sum(c.isalpha() for c in t) >= 3:
-        return t.replace("0", "o").replace("1", "l")
+    """cu1tural -> cultural, 5atguru -> satguru, 8ashaw -> bashaw (digit-for-letter noise in name words)."""
+    if sum(c.isalpha() for c in t) >= 3 and any(c.isdigit() for c in t):
+        return _LOOK_RE.sub(lambda m: _LOOK[m.group(0)], t)
     return t
 
 

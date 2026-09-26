@@ -24,9 +24,9 @@ STACK = {"objective": "binary:logistic", "max_depth": 3, "eta": 0.1, "monotone_c
          "tree_method": "hist"}
 
 
-def _torch():
+def _torch(base: str = BASE):
     import os
-    hub = Path(os.environ.get("HF_HOME", "")) / "hub" / ("models--" + BASE.replace("/", "--"))
+    hub = Path(os.environ.get("HF_HOME", "")) / "hub" / ("models--" + base.replace("/", "--"))
     if hub.exists():  # base weights already downloaded once -> never touch the network again
         os.environ.setdefault("HF_HUB_OFFLINE", "1")
     import torch
@@ -44,10 +44,11 @@ def texts(pp, pairs: pl.DataFrame, split: str) -> pl.DataFrame:
         pl.col("t1").fill_null(""), pl.col("t2").fill_null(""))
 
 
-def train_ce(pp, run, src_run: Path, out: Path, n_pairs: int = 600_000, epochs: int = 2, seed: int = 42) -> None:
+def train_ce(pp, run, src_run: Path, out: Path, n_pairs: int = 600_000, epochs: int = 2, seed: int = 42,
+             base: str = BASE) -> None:
     """Fine-tune on non-val training pairs of src_run (hard region: re-ranker score >= 0.02 or strong name/address
     overlap), balanced 50/50. The re-ranker never saw these S1, so rr is an honest selector here."""
-    torch, Model, Tok = _torch()
+    torch, Model, Tok = _torch(base)
     dev = "cuda" if torch.cuda.is_available() else "cpu"
     parts = sorted((src_run / "train_feats").glob("part-*.parquet"))
     tr = pl.concat([pl.read_parquet(f, columns=["s1_idx", "cand_idx", "label", "rr", "nc_tset", "ad_tset", "is_val"])
@@ -57,10 +58,10 @@ def train_ce(pp, run, src_run: Path, out: Path, n_pairs: int = 600_000, epochs: 
     n_pos = min(pos.height, n_pairs // 2)
     tr = (pl.concat([pos.sample(n=n_pos, seed=seed), neg.sample(n=min(neg.height, n_pairs - n_pos), seed=seed)])
           .sample(fraction=1.0, shuffle=True, seed=seed + 1))
-    run.log(f"ce-train: {tr.height:,} pairs (pos {n_pos:,}) from {hard.height:,} hard pairs, device {dev}")
+    run.log(f"ce-train: base {base}, {tr.height:,} pairs (pos {n_pos:,}) from {hard.height:,} hard pairs, device {dev}")
     tr = texts(pp, tr.select("s1_idx", "cand_idx", "label"), "train")
-    tok = Tok.from_pretrained(BASE)
-    model = Model.from_pretrained(BASE, num_labels=1).to(dev)
+    tok = Tok.from_pretrained(base)
+    model = Model.from_pretrained(base, num_labels=1).to(dev)
     opt = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=0.01)
     steps = epochs * (tr.height // BS)
     sched = torch.optim.lr_scheduler.OneCycleLR(opt, max_lr=LR, total_steps=steps, pct_start=0.06)
@@ -180,4 +181,4 @@ def apply_ce(pp, cfg, run, src_run: Path, pred_run: Path, ce_dir: Path) -> None:
     _restack(sc, tb, stacker.predict(xgb.DMatrix(_x(tb)))).write_parquet(spill / "scored-00000.parquet")
     run.set_metrics(test_band_pairs=tb.height)
     run.end_stage()
-    pp.decide_stage(cfg, run, spill, dec)
+    pp.decide_stage(cfg, run, spill, dec, labelled=pp.labelled_countries(src_run))

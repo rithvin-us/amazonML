@@ -15,7 +15,7 @@ OUTPUT_DIR = ROOT / "output"
 TMP_DIR = ROOT / "tmp"
 LOCAL_CACHE = ROOT / ".cache"
 VALIDATOR = ROOT / "student_resource" / "utils" / "validate_submission.py"
-NORM_VERSION = "v4"  # bump when normalize.py output changes -> fresh cache/norm_<split>_<kind>_<ver>
+NORM_VERSION = "v5"  # bump when normalize.py output changes -> fresh cache/norm_<split>_<kind>_<ver>
 
 # Keep every temp/cache write on the project drive (C: is full). Child processes inherit these.
 _ENV_DIRS = {

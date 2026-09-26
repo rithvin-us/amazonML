@@ -292,7 +292,9 @@ def train_model(cfg: Config, run: Run, train_files: list[Path], va: pl.DataFrame
                 if self.i == len(train_files):
                     return False
                 df = pl.read_parquet(train_files[self.i]).filter(~pl.col("is_val") & ~pl.col("is_es"))
+                # optional per-row weight column "w" (pseudo-labelled rows from an unseen country)
                 input_data(data=df.select(FEATURES).to_numpy(), label=df["label"].to_numpy(),
+                           weight=(df["w"] if "w" in df.columns else pl.Series([1.0] * df.height)).cast(pl.Float32).to_numpy(),
                            feature_names=FEATURES)
                 self.i += 1
                 return True
@@ -488,7 +490,12 @@ def train_stage(cfg: Config, run: Run) -> None:
     rest = blk.join(bl.select("block"), on="block", how="anti")["entity_id"]
     use = pl.concat([val_ids, rest.sample(n=min(n_use - val_ids.len(), rest.len()), seed=cfg.seed, shuffle=True)])
     reranker = None
-    if cfg.extra.get("use_rr", True):
+    if cfg.extra.get("reranker_from"):  # reuse: identical test candidates -> `rescore` on saved test features
+        src_rr = RUNS_DIR / cfg.extra["reranker_from"]
+        shutil.copy(src_rr / "reranker.json", run.dir / "reranker.json")
+        reranker = load_reranker(run.dir, cfg.device)
+        run.log(f"re-ranker reused from {src_rr.name}")
+    elif cfg.extra.get("use_rr", True):
         run.start_stage("fit_reranker")
         reranker = fit_reranker(cfg, run, rest.filter(~rest.is_in(use)), gt)
         run.end_stage()
@@ -602,6 +609,9 @@ def retrain_stage(cfg: Config, run: Run, src: Path) -> None:
     """New matcher on another run's saved train_feats (same candidates/features, e.g. other depth/lr/seed), then
     the usual val scoring + competitor-aware tuning. Test: `rescore --run <this> --feats-run <run with test_feats>`."""
     files = sorted((src / "train_feats").glob("part-*.parquet"))
+    extra = sorted(Path(cfg.extra["extra_parts"]).glob("part-*.parquet")) if cfg.extra.get("extra_parts") else []
+    if extra:  # e.g. pseudo-labelled test pairs of an unseen country: training rows only, never val / early stop
+        run.log(f"retrain: + {len(extra)} extra parts from {cfg.extra['extra_parts']}")
     for name in ("reranker.json",):  # predict/rescore of this run must block exactly like the source run
         if (src / name).exists():
             shutil.copy(src / name, run.dir / name)
@@ -613,7 +623,7 @@ def retrain_stage(cfg: Config, run: Run, src: Path) -> None:
     run.set_metrics(retrain_from=src.name, **{k: v for k, v in json.loads((src / "metrics.json").read_text()).items()
                                               if k in ("block_recall", "avg_candidates", "n_s1", "n_val_s1")})
     run.start_stage("train_model")
-    model = train_model(cfg, run, files, es)
+    model = train_model(cfg, run, files + extra, es)
     del es
     gc.collect()
     run.end_stage()
@@ -690,7 +700,7 @@ def predict_stage(cfg: Config, run: Run, model_run_dir: Path) -> None:
     run.end_stage()
     del s1
     gc.collect()
-    decide_stage(cfg, run, spill, dec, n_pairs)
+    decide_stage(cfg, run, spill, dec, n_pairs, labelled_countries(model_run_dir))
 
 
 def _spill_scored(feats: pl.DataFrame, model: Model, spill: Path, part_no: int, p_floor: float) -> int:
@@ -721,10 +731,49 @@ def rescore_stage(cfg: Config, run: Run, model_run_dir: Path, feats_run_dir: Pat
         n_pairs += _spill_scored(pl.read_parquet(fp), model, spill, i, cfg.p_floor)  # brank is a saved FEATURE
         run.progress((i + 1) / len(parts), f"{i + 1}/{len(parts)} parts")
     run.end_stage()
-    decide_stage(cfg, run, spill, dec, n_pairs)
+    decide_stage(cfg, run, spill, dec, n_pairs, labelled_countries(model_run_dir))
 
 
-def decide_stage(cfg: Config, run: Run, spill: Path, dec: dict, n_pairs: int | None = None) -> None:
+def labelled_countries(run_dir: Path) -> set[str] | None:
+    """Countries the model's decision was tuned on (present in its validation set)."""
+    vt = run_dir / "val_truth.parquet"
+    return set(pl.read_parquet(vt, columns=["country_n"])["country_n"].drop_nulls().unique().to_list()) if vt.exists() else None
+
+
+def shape_matched_selection(scored: pl.DataFrame, dec: dict, labelled: set[str], floor: float, run: Run) -> pl.DataFrame:
+    """Labelled countries: the val-tuned decision. A country with no validation labels (open set, e.g. one unseen in
+    training): the threshold at which its predicted matches per S1 equal the labelled countries' (the generator's
+    match-count distribution is identical across the training countries). Unlabelled countries over-match otherwise."""
+    cmap = scan_norm("test", "s1").select(pl.col("idx").alias("s1_idx"), "country_n").collect()
+    n_s1 = dict(cmap.group_by("country_n").len().iter_rows())
+    scored = scored.join(cmap, on="s1_idx", how="left")
+    mean_k = lambda sel, c: sel.height / max(n_s1.get(c, 1), 1)  # noqa: E731
+    sels, ks = [], []
+    for c in sorted(n_s1):
+        if c in labelled:
+            sel = apply_decision(scored.filter(pl.col("country_n") == c), dec, floor)
+            sels.append(sel)
+            ks.append((mean_k(sel, c), n_s1[c]))
+    target = sum(k * w for k, w in ks) / max(sum(w for _, w in ks), 1)
+    for c in sorted(n_s1):
+        if c in labelled:
+            continue
+        part = scored.filter(pl.col("country_n") == c)
+        best = None
+        for t in [x / 1000 for x in range(int(float(np.atleast_1d(dec["param"])[0]) * 1000), 991, 5)]:
+            d = {"mode": "threshold", "param": t, "excl": dec.get("excl", False)}
+            sel = apply_decision(part, d, floor)
+            gap = abs(mean_k(sel, c) - target)
+            if best is None or gap < best[0]:
+                best = (gap, d, sel)
+        run.log(f"unlabelled country {c}: {best[1]} -> {mean_k(best[2], c):.3f} matches/S1 (labelled target {target:.3f})")
+        run.set_metrics(**{f"decision_{c}": best[1]})
+        sels.append(best[2])
+    return pl.concat(sels).drop("country_n")
+
+
+def decide_stage(cfg: Config, run: Run, spill: Path, dec: dict, n_pairs: int | None = None,
+                 labelled: set[str] | None = None) -> None:
     """Decision + TSV writing + validation from a run's pred/ spill (scored-*.parquet, cand-*.parquet).
 
     Also used standalone (`pipeline.py decide --run <id>`) to re-decide without re-blocking. s1_idx is the
@@ -741,8 +790,11 @@ def decide_stage(cfg: Config, run: Run, spill: Path, dec: dict, n_pairs: int | N
     gc.collect()
     scored = pl.read_parquet(spill / "scored-*.parquet")
     # main = the val-best decision (incl. its exclusivity choice); alt = same rule with exclusivity flipped
-    sel = apply_decision(scored, dec, cfg.p_floor)
-    alt = apply_decision(scored, {**dec, "excl": not dec.get("excl")}, cfg.p_floor)
+    if labelled and cfg.extra.get("unlabelled_shape", True):
+        sel = shape_matched_selection(scored, dec, labelled, cfg.p_floor, run)
+    else:
+        sel = apply_decision(scored, dec, cfg.p_floor)
+    alt = apply_decision(scored, {**dec, "excl": not dec.get("excl")}, cfg.p_floor)  # plain val-tuned rule everywhere
     del scored
     _write_ids(s1_map, _join_ids(sel), "matched_entity_ids", out_dir / "matching_results.tsv")
     _write_ids(s1_map, _join_ids(alt), "matched_entity_ids", out_dir / "matching_results_alt.tsv")
@@ -830,7 +882,12 @@ def main() -> None:
     ap.add_argument("--rr-min", type=int, default=3, help="always keep this many top re-ranked candidates")
     ap.add_argument("--ce-pairs", type=int, default=600_000, help="ce-train: training pairs")
     ap.add_argument("--ce-epochs", type=int, default=2, help="ce-train: epochs")
+    ap.add_argument("--ce-base", default="cross-encoder/ms-marco-MiniLM-L6-v2", help="ce-train: base model (Apache-2.0)")
     ap.add_argument("--ce-dir", default=None, help="ce-apply: fine-tuned model dir (default models/ce_<run>)")
+    ap.add_argument("--no-unlabelled-shape", action="store_true",
+                    help="apply the val-tuned decision to countries without validation labels too")
+    ap.add_argument("--reranker-from", default=None, help="train: reuse this run's re-ranker instead of fitting one")
+    ap.add_argument("--extra-parts", default=None, help="retrain: dir of extra labelled parts (FEATURES, label, w)")
     ap.add_argument("--save-test-feats", action="store_true", help="predict: keep test features for `rescore`")
     ap.add_argument("--feats-run", default=None, help="rescore: run id holding test_feats/")
     ap.add_argument("--no-comp", action="store_true", help="tune the decision on val S1 only (no competitor S1)")
@@ -857,7 +914,7 @@ def main() -> None:
     if a.lr:
         cfg.xgb_lr = a.lr
     cfg.extra.update(train_max_s1=a.train_max_s1, val_max_s1=a.val_max_s1, max_df=a.max_df, threshold_override=a.threshold,
-                     prep_workers=a.prep_workers, k_name=a.k_name, k_addr=a.k_addr, use_rr=not a.no_rr, use_comp=not a.no_comp, save_test_feats=a.save_test_feats,
+                     prep_workers=a.prep_workers, k_name=a.k_name, k_addr=a.k_addr, use_rr=not a.no_rr, use_comp=not a.no_comp, save_test_feats=a.save_test_feats, extra_parts=a.extra_parts, reranker_from=a.reranker_from, unlabelled_shape=not a.no_unlabelled_shape,
                      rr_keep=a.rr_keep, rr_wide=tuple(int(x) for x in a.rr_wide.split(",")), rr_fit_s1=a.rr_fit_s1, rr_tau=a.rr_tau, rr_min=a.rr_min)
     run = Run(cfg.run_name, cfg.to_dict())
     try:
@@ -881,7 +938,8 @@ def main() -> None:
                 me = sys.modules[__name__]
                 ce_dir = Path(a.ce_dir) if a.ce_dir else ROOT / "models" / f"ce_{a.run}"
                 if a.cmd == "ce-train":
-                    ce.train_ce(me, run, RUNS_DIR / a.run, ce_dir, n_pairs=a.ce_pairs, epochs=a.ce_epochs, seed=cfg.seed)
+                    ce.train_ce(me, run, RUNS_DIR / a.run, ce_dir, n_pairs=a.ce_pairs, epochs=a.ce_epochs,
+                                seed=cfg.seed, base=a.ce_base)
                 else:
                     ce.apply_ce(me, cfg, run, RUNS_DIR / a.run, RUNS_DIR / (a.feats_run or a.run), ce_dir)
             if a.cmd == "rescore":
@@ -894,7 +952,7 @@ def main() -> None:
                 if a.threshold:
                     dec = {"mode": "threshold", "param": a.threshold, "excl": dec["excl"]}
                 run.log(f"re-deciding {src.name} pred/ with {dec}")
-                decide_stage(cfg, run, src / "pred", dec)
+                decide_stage(cfg, run, src / "pred", dec, labelled=labelled_countries(src))
             if a.cmd == "stage2":
                 from stage2 import run_stage2
                 run_stage2(RUNS_DIR / a.run, run, device=cfg.device, seed=cfg.seed, workers=cfg.n_jobs,
