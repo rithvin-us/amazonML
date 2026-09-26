@@ -29,7 +29,8 @@ import psutil
 
 from blocking import BLOCK_VERSION, BlockIndex
 from config import CACHE_DIR, NORM_VERSION, OUTPUT_DIR, ROOT, RUNS_DIR, VALIDATOR, Config
-from features import FEATURES, RR_FEATURES, TEXT_COLS, add_name_counts, build_features, rerank_sims
+from features import (FEATURES, RR_FEATURES, TEXT_COLS, add_name_counts, build_features, country_context,
+                      rerank_sims)
 from hwmon import HwMonitor
 from io_utils import load_ground_truth
 from tracking import Run, record_lb_score
@@ -173,7 +174,9 @@ def iter_country_blocks(split: str, s1_all: pl.DataFrame, cfg: Config, run: Run,
     for c in cs:
         s1_c = s1_all.filter(pl.col("country_n") == c)
         pool_c = scan_norm(split, "pool").filter(pl.col("country_n") == c).select(NORM_COLS).collect()
-        s1_c, pool_c = add_name_counts([s1_c, pool_c], pool_c, scan_norm(split, "s1").filter(pl.col("country_n") == c))
+        s1_pop = scan_norm(split, "s1").filter(pl.col("country_n") == c)
+        s1_c, pool_c = add_name_counts([s1_c, pool_c], pool_c, s1_pop)
+        ctx = country_context(s1_pop)  # address stop tokens + S1 name vocabulary (unlabelled S1 population)
         run.log(f"[{c}] S1 {s1_c.height:,}  pool {pool_c.height:,}: building index (RAM avail {avail_gb():.1f}GB)")
         index, hit = country_index(split, c, pool_c, cfg)
         run.log(f"[{c}] index {'loaded from cache' if hit else 'built + cached'}: keys kept {len(index.idf):,}/"
@@ -186,7 +189,7 @@ def iter_country_blocks(split: str, s1_all: pl.DataFrame, cfg: Config, run: Run,
                 pairs = index.query(part, top_k=cfg.max_candidates, chunk=cfg.chunk_size,
                                     k_name=cfg.extra.get("k_name", 10), k_addr=cfg.extra.get("k_addr", 5)
                                     ).with_columns(pl.lit(None, pl.Float32).alias("rr"), pl.lit(None, pl.Float32).alias("rr_rank"))
-            feats = build_features(pairs, part, pool_c, workers=cfg.n_jobs)
+            feats = build_features(pairs, part, pool_c, workers=cfg.n_jobs, ctx=ctx)
             done += part.height
             run.progress(done / n_all, f"[{c}] {done:,}/{n_all:,} S1 blocked+featurised")
             yield c, part, pool_c, feats
@@ -416,6 +419,25 @@ def tune_decision(scored: pl.DataFrame, truth_counts: pl.DataFrame, floor: float
 
 
 # ---------------------------------------------------------------- train
+def score_competitors(cfg: Config, run: Run, model: Model, reranker, va: pl.DataFrame, val_ids: pl.Series) -> pl.DataFrame:
+    """Non-val S1 that own (by GT) a pool record some val S1 puts p >= 0.05 on. On test every S1 competes for
+    every pool record; without these owners, exclusivity on val is weaker than on test and the decision is
+    tuned on the wrong precision. They are scored like test S1 and never enter the metric."""
+    hot = va.filter(pl.col("p") >= 0.05)["cand_idx"].unique()
+    mids = (scan_norm("train", "pool").filter(pl.col("idx").is_in(hot.implode()))
+            .select(pl.col("entity_id").alias("match_id")).collect())
+    owners = (load_ground_truth().drop_nulls().join(mids, on="match_id", how="semi")
+              .filter(~pl.col("s1_id").is_in(val_ids.implode()))["s1_id"].unique())
+    s1o = scan_norm("train", "s1").filter(pl.col("entity_id").is_in(owners.implode())).select(NORM_COLS).collect()
+    run.log(f"val competitors: {s1o.height:,} non-val S1 own {mids.height:,} hot val candidates")
+    out = [pl.DataFrame(schema={"s1_idx": pl.Int64, "cand_idx": pl.Int64, "p": pl.Float32})]
+    if s1o.height:
+        for c, part, pool_c, feats in iter_country_blocks("train", s1o, cfg, run, reranker):
+            out.append(feats.select(pl.col("s1_idx").cast(pl.Int64), pl.col("cand_idx").cast(pl.Int64)).with_columns(
+                pl.Series("p", model.predict(feats.select(FEATURES).to_numpy()), dtype=pl.Float32)))
+    return pl.concat(out).filter(pl.col("p") >= cfg.p_floor)
+
+
 def s1_blocks(split: str, max_size: int = 2000) -> pl.DataFrame:
     """entity_id -> block = country | city (2nd-to-last comma part of raw S1 address, digits dropped) | name_core[:1].
 
@@ -516,14 +538,26 @@ def train_stage(cfg: Config, run: Run) -> None:
     gc.collect()
     run.end_stage()
 
-    run.start_stage("tune")
     va = va.select("s1_idx", "cand_idx", "label").with_columns(
         pl.Series("p", model.predict(va.select(FEATURES).to_numpy()), dtype=pl.Float32))
     va.write_parquet(run.dir / "val_scored.parquet")  # for offline error analysis / re-decisions
+    scored = va
+    if cfg.extra.get("use_comp", True):
+        run.start_stage("val_competitors")
+        comp = score_competitors(cfg, run, model, reranker, va, val_ids)
+        comp.write_parquet(run.dir / "comp_scored.parquet")
+        scored = pl.concat([va, comp.select("s1_idx", "cand_idx", pl.lit(0, pl.Int8).alias("label"), "p")])
+        run.end_stage()
+
+    run.start_stage("tune")
     tvc = tv.select("s1_idx", "n_true")
     (tv.select("s1_idx", "s1_id", "n_true").join(blk.rename({"entity_id": "s1_id"}), on="s1_id", how="left")
      .write_parquet(run.dir / "val_truth.parquet"))  # stage 2 (post-hoc) needs every val S1 incl. no-cand ones
-    res = tune_decision(va, tvc, cfg.p_floor, run)
+    if scored is not va:  # decision tuned WITH competitors (as on test); val-only numbers logged for reference
+        solo = max(tune_decision(va, tvc, cfg.p_floor, run).values(), key=lambda d: d["f05"])
+        run.set_metrics(val_f05_no_comp=round(solo["f05"], 5))
+        run.log(f"metric val_f05 without competitors={solo['f05']:.5f} ({solo['mode']}:{solo['param']} excl={solo['excl']})")
+    res = tune_decision(scored, tvc, cfg.p_floor, run)
     dec = max(res.values(), key=lambda d: d["f05"])
     run.set_metrics(decision_mode=dec["mode"], decision_param=dec["param"], decision_excl=dec["excl"],
                     threshold=res["threshold"]["param"], val_f05=round(dec["f05"], 5),
@@ -535,9 +569,10 @@ def train_stage(cfg: Config, run: Run) -> None:
     # per-country val breakdown (tells us how France-like generalisation may behave)
     cmap = s1.select(pl.col("idx").alias("s1_idx"), "country_n")
     per_c = {}
+    sel_all = apply_decision(scored, dec, cfg.p_floor)
     for c in cmap["country_n"].unique().to_list():
         ids_c = cmap.filter(pl.col("country_n") == c)["s1_idx"].implode()
-        per_c[c] = round(eval_selection(apply_decision(va.filter(pl.col("s1_idx").is_in(ids_c)), dec, cfg.p_floor),
+        per_c[c] = round(eval_selection(sel_all.filter(pl.col("s1_idx").is_in(ids_c)),
                                         tvc.filter(pl.col("s1_idx").is_in(ids_c)))["f05"], 5)
     run.set_metrics(val_f05_by_country=per_c)
     run.log(f"metric val_f05={dec['f05']:.5f} P={dec['precision']:.4f} R={dec['recall']:.4f} "
@@ -721,6 +756,9 @@ def main() -> None:
     ap.add_argument("--rr-keep", type=int, default=40, help="candidates kept per S1 after re-ranking")
     ap.add_argument("--rr-wide", default="300,60,60", help="wide retrieval: top_k,k_name,k_addr before re-ranking")
     ap.add_argument("--rr-fit-s1", type=int, default=5000, help="held-out S1 per country for fitting the re-ranker")
+    ap.add_argument("--no-comp", action="store_true", help="tune the decision on val S1 only (no competitor S1)")
+    ap.add_argument("--depth", type=int, default=None, help="override xgb max_depth")
+    ap.add_argument("--lr", type=float, default=None, help="override xgb learning rate")
     a = ap.parse_args()
 
     if a.cmd == "lb":
@@ -737,8 +775,12 @@ def main() -> None:
     cfg.model, cfg.device, cfg.s1_chunk = a.model, a.device, a.s1_chunk
     if a.rounds:
         cfg.xgb_rounds = a.rounds
+    if a.depth:
+        cfg.xgb_depth = a.depth
+    if a.lr:
+        cfg.xgb_lr = a.lr
     cfg.extra.update(train_max_s1=a.train_max_s1, val_max_s1=a.val_max_s1, max_df=a.max_df, threshold_override=a.threshold,
-                     prep_workers=a.prep_workers, k_name=a.k_name, k_addr=a.k_addr, use_rr=not a.no_rr,
+                     prep_workers=a.prep_workers, k_name=a.k_name, k_addr=a.k_addr, use_rr=not a.no_rr, use_comp=not a.no_comp,
                      rr_keep=a.rr_keep, rr_wide=tuple(int(x) for x in a.rr_wide.split(",")), rr_fit_s1=a.rr_fit_s1)
     run = Run(cfg.run_name, cfg.to_dict())
     try:

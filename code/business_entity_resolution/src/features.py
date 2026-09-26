@@ -6,6 +6,8 @@ import polars as pl
 from rapidfuzz import distance, fuzz
 from rapidfuzz.process import cpdist
 
+from normalize import LEGAL_TOKENS
+
 TEXT_COLS = ["name_full", "name_core", "name_skel", "addr", "postcode", "addr_nums", "country_n", "src"]
 
 FEATURES = [
@@ -24,7 +26,16 @@ FEATURES = [
     # v5: blocking re-ranker score/rank, fuzzy house number (8250~8252 is a typo, 33 vs 46 a different
     # building), S1 initials as prefix of a handle-style candidate ("lex communication" -> "lcprivate")
     "rr", "rr_rank", "hn_sim", "hn_prefix", "init_pref",
+    # v6 pair: address without city/state-level tokens, renamed (out-of-vocabulary) candidate names,
+    # legal-form agreement
+    "ad_core_tset", "ad_core_empty", "c_oov_frac", "legal_eq", "legal_conflict",
+    # v6 group consensus: distractors are copies of the entity with ONE field nudged (house number
+    # 1030 -> 1031, name word medical -> media). True copies agree with each other; the nudged copy does
+    # not. Anchors = the S1's top-3 candidates by re-ranker score (known before the model).
+    "anc_nc_mean", "anc_nc_max", "anc_ad_mean", "anc_ad_max", "hn_vote", "n_anc_hn",
+    "twin_better", "n_hn_eq_s1", "ad_tset_rank", "hn_sim_rank", "ncc_ratio_rank", "ad_core_rank",
 ]
+N_ANCHORS = 3
 # re-ranker inputs: blocking scores + three cheap fuzzy sims (see rerank_sims)
 RR_FEATURES = ["bscore", "bscore_norm", "bname", "baddr", "bname_norm", "baddr_norm", "brank", "brank_name",
                "brank_addr", "r_cc_ratio", "r_nf_part", "r_ad_tset"]
@@ -58,6 +69,20 @@ def add_name_counts(frames: list[pl.DataFrame], pool: pl.DataFrame, s1_all: pl.L
             .with_columns(pl.col(CNT_COLS).fill_null(0.0)) for f in frames]
 
 
+def country_context(s1_all: pl.LazyFrame, stop_frac: float = 0.002) -> dict:
+    """Per-country vocabularies from the (unlabelled) S1 population of the split:
+    addr_stop  address tokens in >= stop_frac of S1 addresses (city / state / 'rd'), digits never included
+    name_vocab every name_core token seen in any S1 name (pool names outside it were renamed or mangled)."""
+    s = s1_all.select(pl.col("name_core").fill_null(""), pl.col("addr").fill_null("")).collect()
+    n = max(s.height, 1)
+    adf = (s.select(pl.col("addr").str.split(" ").list.unique().alias("t")).explode("t")
+           .filter(pl.col("t").str.len_chars() > 0).group_by("t").len())
+    stop = adf.filter((pl.col("len") >= max(20, stop_frac * n)) & ~pl.col("t").str.contains(r"\d"))["t"]
+    vocab = (s.select(pl.col("name_core").str.split(" ").alias("t")).explode("t")
+             .filter(pl.col("t").str.len_chars() > 0)["t"].unique())
+    return {"addr_stop": stop, "name_vocab": vocab}
+
+
 def rerank_sims(pairs: pl.DataFrame, s1: pl.DataFrame, pool: pl.DataFrame, workers: int = -1) -> pl.DataFrame:
     """Adds r_cc_ratio (compact name), r_nf_part (full name partial), r_ad_tset (address token set) to
     wide blocking output. Cheap enough for ~350 candidates per S1."""
@@ -74,8 +99,30 @@ def rerank_sims(pairs: pl.DataFrame, s1: pl.DataFrame, pool: pl.DataFrame, worke
         pl.Series("r_ad_tset", _pair_scores(g("addr_1"), g("addr_2"), fuzz.token_set_ratio, workers)))
 
 
-def build_features(pairs: pl.DataFrame, s1: pl.DataFrame, pool: pl.DataFrame, workers: int = -1) -> pl.DataFrame:
-    """pairs: blocking output (s1_idx, cand_idx, bscore, ...). s1/pool: idx + TEXT_COLS + CNT_COLS."""
+def _anchor_features(a: pl.DataFrame, hn2: pl.Series, workers: int) -> pl.DataFrame:
+    """Similarity of each candidate to the S1's other top-N_ANCHORS candidates (by re-ranker rank)."""
+    base = a.select("s1_idx", "cand_idx", pl.coalesce(pl.col("rr_rank"), pl.col("brank").cast(pl.Float32)).alias("_k"),
+                    pl.col("name_core_2").fill_null("").alias("c_nc"), pl.col("addr_2").fill_null("").alias("c_ad")
+                    ).with_columns(hn2.alias("c_hn"))
+    anc = base.filter(pl.col("_k") <= N_ANCHORS).select(
+        "s1_idx", pl.col("cand_idx").alias("a_idx"), pl.col("c_nc").alias("a_nc"), pl.col("c_ad").alias("a_ad"),
+        pl.col("c_hn").alias("a_hn"))
+    x = base.join(anc, on="s1_idx").filter(pl.col("a_idx") != pl.col("cand_idx"))
+    x = x.with_columns(
+        pl.Series("s_nc", _pair_scores(x["c_nc"].to_list(), x["a_nc"].to_list(), fuzz.token_set_ratio, workers)),
+        pl.Series("s_ad", _pair_scores(x["c_ad"].to_list(), x["a_ad"].to_list(), fuzz.token_set_ratio, workers)),
+        pl.when(pl.col("c_hn").is_not_null() & pl.col("a_hn").is_not_null())
+        .then((pl.col("c_hn") == pl.col("a_hn")).cast(pl.Float32)).alias("hv"))
+    return x.group_by("s1_idx", "cand_idx").agg(
+        pl.col("s_nc").mean().alias("anc_nc_mean"), pl.col("s_nc").max().alias("anc_nc_max"),
+        pl.col("s_ad").mean().alias("anc_ad_mean"), pl.col("s_ad").max().alias("anc_ad_max"),
+        pl.col("hv").mean().alias("hn_vote"), pl.col("hv").count().cast(pl.Float32).alias("n_anc_hn"))
+
+
+def build_features(pairs: pl.DataFrame, s1: pl.DataFrame, pool: pl.DataFrame, workers: int = -1,
+                   ctx: dict | None = None) -> pl.DataFrame:
+    """pairs: blocking output (s1_idx, cand_idx, bscore, ..., rr, rr_rank). s1/pool: idx + TEXT_COLS + CNT_COLS.
+    ctx: country_context() of the split's S1 population (address stop tokens, S1 name vocabulary)."""
     cols = ["idx"] + TEXT_COLS + CNT_COLS
     a = pairs.join(s1.select(cols).rename({c: c + "_1" for c in cols}),
                    left_on="s1_idx", right_on="idx_1", how="left", maintain_order="left")
@@ -107,6 +154,24 @@ def build_features(pairs: pl.DataFrame, s1: pl.DataFrame, pool: pl.DataFrame, wo
     f["num_jacc"], f["num_both"] = num_j, num_b
     hn1, hn2 = a["addr_1"].str.extract(_HOUSE_NO, 1), a["addr_2"].str.extract(_HOUSE_NO, 1)
     f["hn_sim"] = _pair_scores(hn1.fill_null("").to_list(), hn2.fill_null("").to_list(), fuzz.ratio, workers)
+    stop = ctx["addr_stop"] if ctx else pl.Series("t", [], dtype=pl.String)
+    vocab = ctx["name_vocab"] if ctx else None
+    core = lambda c: (a[c].fill_null("").str.split(" ")  # noqa: E731
+                      .list.eval(pl.element().filter(~pl.element().is_in(stop) & (pl.element() != ""))).list.join(" "))
+    core1, core2 = core("addr_1"), core("addr_2")
+    f["ad_core_tset"] = _pair_scores(core1.to_list(), core2.to_list(), fuzz.token_set_ratio, workers)
+    legal = lambda c: a[c].fill_null("").str.split(" ").list.eval(  # noqa: E731
+        pl.element().filter(pl.element().is_in(sorted(LEGAL_TOKENS)))).list.unique()
+    lg = pl.DataFrame({"l1": legal("name_full_1"), "l2": legal("name_full_2")}).select(
+        ((pl.col("l1").list.len() > 0) & (pl.col("l2").list.len() > 0)
+         & (pl.col("l1").list.set_symmetric_difference("l2").list.len() == 0)).cast(pl.Float32).alias("legal_eq"),
+        ((pl.col("l1").list.len() > 0) & (pl.col("l2").list.len() > 0)
+         & (pl.col("l1").list.set_intersection("l2").list.len() == 0)).cast(pl.Float32).alias("legal_conflict"))
+    if vocab is not None:
+        oov = (a["name_core_2"].fill_null("").str.split(" ")
+               .list.eval(pl.element().filter(pl.element() != "").is_in(vocab).not_().cast(pl.Float32)).list.mean())
+    else:
+        oov = pl.Series("oov", [None] * a.height, dtype=pl.Float32)
     feats = a.select("s1_idx", "cand_idx", "bscore", "bscore_norm", "brank", "bname", "baddr", "bname_norm",
                      "baddr_norm", "brank_name", "brank_addr", "rr", "rr_rank"
                      ).with_columns([pl.Series(k, v) for k, v in f.items()])
@@ -120,7 +185,9 @@ def build_features(pairs: pl.DataFrame, s1: pl.DataFrame, pool: pl.DataFrame, wo
         .fill_null(False).cast(pl.Float32).alias("hn_prefix"),
         ((pl.col("i1").str.len_chars() >= 2) & (pl.col("i1").str.len_chars() < pl.col("n1").str.len_chars())
          & pl.col("c2").str.starts_with(pl.col("i1"))).fill_null(False).cast(pl.Float32).alias("init_pref"))
-    feats = feats.with_columns(extra["hn_prefix"], extra["init_pref"])
+    feats = feats.with_columns(extra["hn_prefix"], extra["init_pref"], lg["legal_eq"], lg["legal_conflict"],
+                               ((core1 == "") | (core2 == "")).cast(pl.Float32).alias("ad_core_empty"),
+                               oov.cast(pl.Float32).alias("c_oov_frac"))
     feats = feats.with_columns(
         (a["name_core_1"].str.split(" ").list.first() == a["name_core_2"].str.split(" ").list.first())
         .cast(pl.Float32).alias("nc_first_eq"),
@@ -147,5 +214,14 @@ def build_features(pairs: pl.DataFrame, s1: pl.DataFrame, pool: pl.DataFrame, wo
         pl.col("nf_tset").rank("average", descending=True).over("s1_idx").alias("nf_tset_rank"),
         (pl.col("nc_tset").max().over("s1_idx") - pl.col("nc_tset")).alias("nc_tset_gap"),
         (pl.col("ad_tset").max().over("s1_idx") - pl.col("ad_tset")).alias("ad_tset_gap"),
+        pl.col("ad_tset").rank("average", descending=True).over("s1_idx").alias("ad_tset_rank"),
+        pl.col("hn_sim").rank("average", descending=True).over("s1_idx").alias("hn_sim_rank"),
+        pl.col("ncc_ratio").rank("average", descending=True).over("s1_idx").alias("ncc_ratio_rank"),
+        pl.col("ad_core_tset").rank("average", descending=True).over("s1_idx").alias("ad_core_rank"),
+        pl.col("hn_eq").sum().over("s1_idx").alias("n_hn_eq_s1"),
+        # a near-identical sibling has the exact house number while this one has a different one
+        (((pl.col("hn_eq") == 1) & (pl.col("nc_tset") >= 90)).any().over("s1_idx")
+         & (pl.col("hn_eq") == 0) & (pl.col("hn_both") == 1)).cast(pl.Float32).alias("twin_better"),
     )
+    feats = feats.join(_anchor_features(a, hn2, workers), on=["s1_idx", "cand_idx"], how="left", maintain_order="left")
     return feats.with_columns(pl.col(FEATURES).cast(pl.Float32))
