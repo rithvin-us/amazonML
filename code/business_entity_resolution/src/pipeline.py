@@ -15,6 +15,8 @@ from __future__ import annotations
 import argparse
 import gc
 import json
+import os
+import re
 import shutil
 import subprocess
 import sys
@@ -25,9 +27,9 @@ import numpy as np
 import polars as pl
 import psutil
 
-from blocking import BlockIndex
+from blocking import BLOCK_VERSION, BlockIndex
 from config import CACHE_DIR, NORM_VERSION, OUTPUT_DIR, ROOT, RUNS_DIR, VALIDATOR, Config
-from features import FEATURES, TEXT_COLS, add_name_counts, build_features
+from features import FEATURES, RR_FEATURES, TEXT_COLS, add_name_counts, build_features, rerank_sims
 from hwmon import HwMonitor
 from io_utils import load_ground_truth
 from tracking import Run, record_lb_score
@@ -37,6 +39,7 @@ PROJECT_DIR = SRC_DIR.parent
 NORM_COLS = ["idx", "entity_id"] + TEXT_COLS
 THRESHOLD_GRID = np.round(np.arange(0.05, 0.96, 0.025), 3)
 ALPHA_GRID = [0.0, 0.1, 0.25, 0.5, 1.0, 2.0]
+TOP1_GRID = [0.2, 0.3, 0.4, 0.5, 0.6]  # "top-1 rescue" floors for S1s with nothing above the main threshold
 
 
 def avail_gb() -> float:
@@ -77,7 +80,93 @@ def countries(split: str) -> list[str]:
 
 
 # ---------------------------------------------------------------- candidates + features
-def iter_country_blocks(split: str, s1_all: pl.DataFrame, cfg: Config, run: Run):
+def country_index(split: str, c: str, pool_c: pl.DataFrame, cfg: Config) -> tuple[BlockIndex, bool]:
+    max_df = cfg.extra.get("max_df", 150)
+    idx_dir = CACHE_DIR / "index" / f"{split}_{re.sub(r'[^a-z0-9]+', '_', c)}_{NORM_VERSION}_b{BLOCK_VERSION}_df{max_df}"
+    return BlockIndex.cached(pool_c, idx_dir, max_df=max_df,
+                             chunk=cfg.extra.get("index_chunk", 100_000))  # smaller key batches = lower peak RAM
+
+
+def _rr_matrix(w: pl.DataFrame) -> np.ndarray:
+    return w.select(pl.col(RR_FEATURES).cast(pl.Float32).fill_null(-1.0)).to_numpy()
+
+
+def wide_query(index: BlockIndex, s1: pl.DataFrame, pool_c: pl.DataFrame, cfg: Config) -> pl.DataFrame:
+    """Wide retrieval (top-W by key score + WN/WA channel extras) with the re-ranker's fuzzy sims attached."""
+    w_top, w_name, w_addr = cfg.extra.get("rr_wide", (300, 60, 60))
+    w = index.query(s1, top_k=w_top, chunk=cfg.chunk_size, k_name=w_name, k_addr=w_addr)
+    return rerank_sims(w, s1, pool_c, workers=cfg.n_jobs)
+
+
+def fit_reranker(cfg: Config, run: Run, s1_ids: pl.Series, gt: pl.DataFrame):
+    """Blocking re-ranker: small XGB on wide candidates of S1 that are in neither train nor val (so its score is
+    an honest feature for the main model). One global model -> also used for unseen countries (France)."""
+    import xgboost as xgb
+    n_per = cfg.extra.get("rr_fit_s1", 5000)
+    parts, n_true = [], 0
+    for c in countries("train"):
+        s1_c = (scan_norm("train", "s1").filter((pl.col("country_n") == c) & pl.col("entity_id").is_in(s1_ids.implode()))
+                .select(NORM_COLS).collect())
+        s1_c = s1_c.sample(n=min(n_per, s1_c.height), seed=cfg.seed)
+        pool_c = scan_norm("train", "pool").filter(pl.col("country_n") == c).select(NORM_COLS).collect()
+        index, _ = country_index("train", c, pool_c, cfg)
+        w = wide_query(index, s1_c, pool_c, cfg)
+        w = (w.join(s1_c.select(pl.col("idx").alias("s1_idx"), pl.col("entity_id").alias("s1_id")), on="s1_idx")
+             .join(pool_c.select(pl.col("idx").alias("cand_idx"), pl.col("entity_id").alias("match_id")), on="cand_idx"))
+        g = gt.join(s1_c.select(pl.col("entity_id").alias("s1_id")), on="s1_id").drop_nulls()
+        n_true += g.height
+        w = w.join(g.with_columns(pl.lit(1, pl.Int8).alias("label")), on=["s1_id", "match_id"], how="left")
+        parts.append(w.select(*RR_FEATURES, "s1_idx", pl.col("label").fill_null(0)))
+        run.log(f"reranker [{c}] fit S1 {s1_c.height:,} wide pairs {w.height:,} (RAM avail {avail_gb():.1f}GB)")
+        del pool_c, index, w
+        gc.collect()
+    d = pl.concat(parts)
+    dev = xgb_device(cfg.device)
+    bst = xgb.train({"objective": "binary:logistic", "tree_method": "hist", "device": dev, "max_depth": 6, "eta": 0.1,
+                     "seed": cfg.seed, "nthread": cfg.n_jobs},
+                    xgb.DMatrix(_rr_matrix(d), d["label"].to_numpy(), feature_names=RR_FEATURES), 300)
+    bst.save_model(str(run.dir / "reranker.json"))
+    d = d.with_columns(pl.Series("rr", bst.predict(xgb.DMatrix(_rr_matrix(d), feature_names=RR_FEATURES))))
+    d = d.with_columns(pl.col("rr").rank("ordinal", descending=True).over("s1_idx").alias("rr_rank"))
+    keep = cfg.extra.get("rr_keep", 40)
+    wide_r = d["label"].sum() / max(n_true, 1)
+    kept_r = d.filter(pl.col("rr_rank") <= keep)["label"].sum() / max(n_true, 1)
+    run.log(f"metric reranker (in-sample) wide recall={wide_r:.4f} top{keep} recall={kept_r:.4f} on {n_true:,} true pairs")
+    run.set_metrics(rr_wide_recall=round(float(wide_r), 4), rr_keep_recall_insample=round(float(kept_r), 4))
+    return bst
+
+
+def load_reranker(run_dir: Path, device: str):
+    p = run_dir / "reranker.json"
+    if not p.exists():
+        return None
+    import xgboost as xgb
+    b = xgb.Booster()
+    b.load_model(str(p))
+    b.set_param({"device": xgb_device(device)})
+    return b
+
+
+def rerank_query(index: BlockIndex, part: pl.DataFrame, pool_c: pl.DataFrame, reranker, cfg: Config) -> pl.DataFrame:
+    """Wide retrieval -> re-ranker score rr -> keep top rr_keep per S1 (in sub-chunks: ~350 cands per S1)."""
+    import xgboost as xgb
+    keep, sub, out = cfg.extra.get("rr_keep", 40), cfg.extra.get("rr_sub", 2500), []
+    for j in range(0, part.height, sub):
+        w = wide_query(index, part.slice(j, sub), pool_c, cfg)
+        if not w.height:
+            continue
+        w = (w.with_columns(pl.Series("rr", reranker.predict(xgb.DMatrix(_rr_matrix(w), feature_names=RR_FEATURES)),
+                                      dtype=pl.Float32))
+             .with_columns(pl.col("rr").rank("ordinal", descending=True).over("s1_idx").cast(pl.Float32).alias("rr_rank"))
+             .filter(pl.col("rr_rank") <= keep).drop("r_cc_ratio", "r_nf_part", "r_ad_tset"))
+        out.append(w)
+    if not out:
+        return index.query(part.slice(0, 0)).with_columns(pl.lit(None, pl.Float32).alias("rr"),
+                                                           pl.lit(None, pl.Float32).alias("rr_rank"))
+    return pl.concat(out)
+
+
+def iter_country_blocks(split: str, s1_all: pl.DataFrame, cfg: Config, run: Run, reranker=None):
     """Yield (country, s1_part, pool_c, pairs_features) per S1 chunk, one country pool in RAM at a time."""
     cs = s1_all["country_n"].unique().sort().to_list()
     done, n_all = 0, s1_all.height
@@ -86,14 +175,17 @@ def iter_country_blocks(split: str, s1_all: pl.DataFrame, cfg: Config, run: Run)
         pool_c = scan_norm(split, "pool").filter(pl.col("country_n") == c).select(NORM_COLS).collect()
         s1_c, pool_c = add_name_counts([s1_c, pool_c], pool_c, scan_norm(split, "s1").filter(pl.col("country_n") == c))
         run.log(f"[{c}] S1 {s1_c.height:,}  pool {pool_c.height:,}: building index (RAM avail {avail_gb():.1f}GB)")
-        index = BlockIndex(pool_c, max_df=cfg.extra.get("max_df", 150),
-                           chunk=cfg.extra.get("index_chunk", 100_000))  # smaller key-build batches = lower peak RAM
-        run.log(f"[{c}] index keys kept {len(index.idf):,}/{index.n_keys_total:,}, postings {index.n_postings:,}"
-                f" (RAM avail {avail_gb():.1f}GB)")
+        index, hit = country_index(split, c, pool_c, cfg)
+        run.log(f"[{c}] index {'loaded from cache' if hit else 'built + cached'}: keys kept {len(index.idf):,}/"
+                f"{index.n_keys_total:,}, postings {index.n_postings:,} (RAM avail {avail_gb():.1f}GB)")
         for i in range(0, s1_c.height, cfg.s1_chunk):
             part = s1_c.slice(i, cfg.s1_chunk)
-            pairs = index.query(part, top_k=cfg.max_candidates, chunk=cfg.chunk_size,
-                                k_name=cfg.extra.get("k_name", 10), k_addr=cfg.extra.get("k_addr", 5))
+            if reranker is not None:
+                pairs = rerank_query(index, part, pool_c, reranker, cfg)
+            else:
+                pairs = index.query(part, top_k=cfg.max_candidates, chunk=cfg.chunk_size,
+                                    k_name=cfg.extra.get("k_name", 10), k_addr=cfg.extra.get("k_addr", 5)
+                                    ).with_columns(pl.lit(None, pl.Float32).alias("rr"), pl.lit(None, pl.Float32).alias("rr_rank"))
             feats = build_features(pairs, part, pool_c, workers=cfg.n_jobs)
             done += part.height
             run.progress(done / n_all, f"[{c}] {done:,}/{n_all:,} S1 blocked+featurised")
@@ -286,27 +378,38 @@ def select_expected_f(scored: pl.DataFrame, alpha: float) -> pl.DataFrame:
             .drop("_ctp", "_m", "_ek", "_lp0", "_ef", "_msel"))
 
 
-def apply_decision(scored: pl.DataFrame, dec: dict, floor: float) -> pl.DataFrame:
-    if dec["mode"] == "threshold":
-        return scored.filter(pl.col("p") >= dec["param"])
-    return select_expected_f(scored.filter(pl.col("p") >= floor), dec["param"])
-
-
 def exclusive(sel: pl.DataFrame) -> pl.DataFrame:
     """GT is one-to-many: a pool record matches at most one S1. Keep each cand only for its best-p S1."""
     return sel.filter(pl.col("p").rank("ordinal", descending=True).over("cand_idx") == 1)
 
 
+def apply_decision(scored: pl.DataFrame, dec: dict, floor: float) -> pl.DataFrame:
+    """dec: {mode, param, excl}. excl -> each pool record is first assigned to its best-p S1 only (GT is
+    exclusive), then the per-S1 rule runs. Modes: threshold (p >= t); thr_top1 (p >= t, plus the S1's best
+    candidate when it has p >= t1 < t); expected_f (per-S1 plug-in expected-F0.5 optimum)."""
+    if dec.get("excl"):
+        scored = exclusive(scored.filter(pl.col("p") >= floor))
+    if dec["mode"] == "threshold":
+        return scored.filter(pl.col("p") >= dec["param"])
+    if dec["mode"] == "thr_top1":
+        t, t1 = dec["param"]
+        top1 = pl.col("p").rank("ordinal", descending=True).over("s1_idx") == 1
+        return scored.filter((pl.col("p") >= t) | (top1 & (pl.col("p") >= t1)))
+    return select_expected_f(scored.filter(pl.col("p") >= floor), dec["param"])
+
+
 def tune_decision(scored: pl.DataFrame, truth_counts: pl.DataFrame, floor: float, run: Run) -> dict:
+    """Best param per (mode, excl) on labelled pairs -> {name: {mode, param, excl, f05, precision, recall}}."""
     res = {}
-    for t in THRESHOLD_GRID:
-        m = eval_selection(apply_decision(scored, {"mode": "threshold", "param": float(t)}, floor), truth_counts)
-        if m["f05"] > res.get("threshold", {"f05": -1})["f05"]:
-            res["threshold"] = {"mode": "threshold", "param": float(t), **m}
-    for a in ALPHA_GRID:
-        m = eval_selection(apply_decision(scored, {"mode": "expected_f", "param": a}, floor), truth_counts)
-        if m["f05"] > res.get("expected_f", {"f05": -1})["f05"]:
-            res["expected_f"] = {"mode": "expected_f", "param": a, **m}
+    cands = ([("threshold", float(t)) for t in THRESHOLD_GRID] + [("expected_f", a) for a in ALPHA_GRID]
+             + [("thr_top1", [float(t), t1]) for t in THRESHOLD_GRID if t >= 0.5 for t1 in TOP1_GRID if t1 < t])
+    for excl in (False, True):
+        base = exclusive(scored.filter(pl.col("p") >= floor)) if excl else scored
+        for mode, param in cands:
+            m = eval_selection(apply_decision(base, {"mode": mode, "param": param}, floor), truth_counts)
+            name = mode + ("+excl" if excl else "")
+            if m["f05"] > res.get(name, {"f05": -1})["f05"]:
+                res[name] = {"mode": mode, "param": param, "excl": excl, **m}
     for k, v in res.items():
         run.log(f"decision {k}: param={v['param']} f05={v['f05']:.5f} P={v['precision']:.4f} R={v['recall']:.4f}")
     return res
@@ -350,6 +453,11 @@ def train_stage(cfg: Config, run: Run) -> None:
     val_ids = blk.join(bl.select("block"), on="block", how="semi")["entity_id"]
     rest = blk.join(bl.select("block"), on="block", how="anti")["entity_id"]
     use = pl.concat([val_ids, rest.sample(n=min(n_use - val_ids.len(), rest.len()), seed=cfg.seed, shuffle=True)])
+    reranker = None
+    if cfg.extra.get("use_rr", True):
+        run.start_stage("fit_reranker")
+        reranker = fit_reranker(cfg, run, rest.filter(~rest.is_in(use)), gt)
+        run.end_stage()
     blk = blk.join(bl.select("block"), on="block", how="semi")  # keep only val rows (for val_truth.parquet)
     del rest
     # is_es: ~5% of the non-val train S1 held out for early stopping (val stays untouched by model selection)
@@ -375,7 +483,7 @@ def train_stage(cfg: Config, run: Run) -> None:
     files, val_parts, es_parts = [], [], []
     n_pairs = n_pos = 0
     pos_all = gt_use.drop_nulls()
-    for c, part, pool_c, feats in iter_country_blocks("train", s1, cfg, run):
+    for c, part, pool_c, feats in iter_country_blocks("train", s1, cfg, run, reranker):
         ids = pool_c.select(pl.col("idx").alias("cand_idx"), pl.col("entity_id").alias("match_id"))
         pos = (pos_all.join(ids, on="match_id")
                .select("s1_idx", "cand_idx").with_columns(pl.lit(1, pl.Int8).alias("label")))
@@ -417,13 +525,12 @@ def train_stage(cfg: Config, run: Run) -> None:
      .write_parquet(run.dir / "val_truth.parquet"))  # stage 2 (post-hoc) needs every val S1 incl. no-cand ones
     res = tune_decision(va, tvc, cfg.p_floor, run)
     dec = max(res.values(), key=lambda d: d["f05"])
-    ex = eval_selection(exclusive(apply_decision(va, dec, cfg.p_floor)), tvc)
-    run.set_metrics(decision_mode=dec["mode"], decision_param=dec["param"],
+    run.set_metrics(decision_mode=dec["mode"], decision_param=dec["param"], decision_excl=dec["excl"],
                     threshold=res["threshold"]["param"], val_f05=round(dec["f05"], 5),
                     val_precision=round(dec["precision"], 4), val_recall=round(dec["recall"], 4),
+                    val_f05_by_decision={k: round(v["f05"], 5) for k, v in res.items()},
                     val_f05_threshold=round(res["threshold"]["f05"], 5),
-                    val_f05_expected_f=round(res["expected_f"]["f05"], 5),
-                    val_f05_excl=round(ex["f05"], 5),
+                    val_f05_excl=round(res["threshold+excl"]["f05"], 5),
                     val_singleton_frac=round(tv.filter(pl.col("n_true") == 0).height / max(tv.height, 1), 4))
     # per-country val breakdown (tells us how France-like generalisation may behave)
     cmap = s1.select(pl.col("idx").alias("s1_idx"), "country_n")
@@ -434,7 +541,7 @@ def train_stage(cfg: Config, run: Run) -> None:
                                         tvc.filter(pl.col("s1_idx").is_in(ids_c)))["f05"], 5)
     run.set_metrics(val_f05_by_country=per_c)
     run.log(f"metric val_f05={dec['f05']:.5f} P={dec['precision']:.4f} R={dec['recall']:.4f} "
-            f"decision={dec['mode']}:{dec['param']} by_country={per_c}")
+            f"decision={dec['mode']}:{dec['param']} excl={dec['excl']} by_country={per_c}")
     run.end_stage()
 
 
@@ -475,11 +582,14 @@ def _check_id_file(path: Path, col: str, n_s1: int, batch: int = 100_000) -> lis
 def predict_stage(cfg: Config, run: Run, model_run_dir: Path) -> None:
     metrics = json.loads((model_run_dir / "metrics.json").read_text())
     dec = {"mode": metrics.get("decision_mode", "threshold"),
-           "param": metrics.get("decision_param", metrics.get("threshold", 0.5))}
+           "param": metrics.get("decision_param", metrics.get("threshold", 0.5)),
+           "excl": metrics.get("decision_excl", False)}
     if cfg.extra.get("threshold_override"):
-        dec = {"mode": "threshold", "param": cfg.extra["threshold_override"]}
+        dec = {"mode": "threshold", "param": cfg.extra["threshold_override"], "excl": dec.get("excl", False)}
     model = Model.load(model_run_dir, cfg.device)
-    run.log(f"model {model.kind} on {model.device}, decision {dec['mode']}:{dec['param']}")
+    reranker = load_reranker(model_run_dir, cfg.device)
+    run.log(f"model {model.kind} on {model.device}, decision {dec['mode']}:{dec['param']} excl={dec.get('excl')} "
+            f"reranker={'yes' if reranker is not None else 'no'}")
 
     run.start_stage("prep_test")
     prep("test", run, cfg)
@@ -492,7 +602,7 @@ def predict_stage(cfg: Config, run: Run, model_run_dir: Path) -> None:
     spill.mkdir()
     run.start_stage("blocking+features+predict_test")
     n_pairs = part_no = 0
-    for c, part, pool_c, feats in iter_country_blocks("test", s1, cfg, run):
+    for c, part, pool_c, feats in iter_country_blocks("test", s1, cfg, run, reranker):
         p = model.predict(feats.select(FEATURES).to_numpy())
         f = (feats.select("s1_idx", "cand_idx", "brank").with_columns(pl.Series("p", p, dtype=pl.Float32))
              .join(pool_c.select(pl.col("idx").alias("cand_idx"), pl.col("entity_id").alias("cid")), on="cand_idx"))
@@ -504,35 +614,44 @@ def predict_stage(cfg: Config, run: Run, model_run_dir: Path) -> None:
         part_no += 1
         del p, f, feats
     run.end_stage()
-
-    run.start_stage("decide+write_test")
-    s1_map = s1.select(pl.col("idx").alias("s1_idx"), pl.col("entity_id").alias("source1_entity_id"))
-    n_s1 = s1_map.height
     del s1
     gc.collect()
+    decide_stage(cfg, run, spill, dec, n_pairs)
+
+
+def decide_stage(cfg: Config, run: Run, spill: Path, dec: dict, n_pairs: int | None = None) -> None:
+    """Decision + TSV writing + validation from a run's pred/ spill (scored-*.parquet, cand-*.parquet).
+
+    Also used standalone (`pipeline.py decide --run <id>`) to re-decide without re-blocking. s1_idx is the
+    test S1 row number in raw source order (the norm caches assign idx the same way).
+    """
+    run.start_stage("decide+write_test")
+    s1_map = (pl.read_parquet(CACHE_DIR / "raw_test_s1.parquet", columns=["entity_id"]).with_row_index("s1_idx")
+              .select(pl.col("s1_idx").cast(pl.Int64), pl.col("entity_id").alias("source1_entity_id")))
+    n_s1 = s1_map.height
     out_dir = run.dir / "output"
     out_dir.mkdir(exist_ok=True)
     _write_ids(s1_map, pl.read_parquet(spill / "cand-*.parquet"), "candidate_entity_ids",
                out_dir / "candidate_pairs.tsv")
     gc.collect()
     scored = pl.read_parquet(spill / "scored-*.parquet")
+    # main = the val-best decision (incl. its exclusivity choice); alt = same rule with exclusivity flipped
     sel = apply_decision(scored, dec, cfg.p_floor)
-    excl = exclusive(sel)
+    alt = apply_decision(scored, {**dec, "excl": not dec.get("excl")}, cfg.p_floor)
     del scored
     _write_ids(s1_map, _join_ids(sel), "matched_entity_ids", out_dir / "matching_results.tsv")
-    _write_ids(s1_map, _join_ids(excl), "matched_entity_ids", out_dir / "matching_results_excl.tsv")
+    _write_ids(s1_map, _join_ids(alt), "matched_entity_ids", out_dir / "matching_results_alt.tsv")
     for fn in ("matching_results.tsv", "candidate_pairs.tsv"):
         shutil.copy(out_dir / fn, OUTPUT_DIR / fn)
     (OUTPUT_DIR / "variants").mkdir(exist_ok=True)
-    shutil.copy(out_dir / "matching_results_excl.tsv", OUTPUT_DIR / "variants" / "matching_results_excl.tsv")
+    shutil.copy(out_dir / "matching_results_alt.tsv", OUTPUT_DIR / "variants" / "matching_results_alt.tsv")
     nonempty = sel["s1_idx"].n_unique()
-    run.set_metrics(test_decision=f"{dec['mode']}:{dec['param']}", test_s1=n_s1, test_nonempty=nonempty,
-                    test_pred_pairs=sel.height, test_pred_pairs_excl=excl.height,
-                    test_excl_dropped=sel.height - excl.height,
-                    test_avg_candidates=round(n_pairs / max(n_s1, 1), 2))
-    run.log(f"metric test nonempty={nonempty:,}/{n_s1:,} pred_pairs={sel.height:,} "
-            f"excl_dropped={sel.height - excl.height:,} avg_cands={n_pairs / max(n_s1, 1):.1f}")
-    del sel, excl
+    run.set_metrics(test_decision=f"{dec['mode']}:{dec['param']} excl={dec.get('excl')}", test_s1=n_s1,
+                    test_nonempty=nonempty, test_pred_pairs=sel.height, test_pred_pairs_alt=alt.height)
+    if n_pairs is not None:
+        run.set_metrics(test_avg_candidates=round(n_pairs / max(n_s1, 1), 2))
+    run.log(f"metric test nonempty={nonempty:,}/{n_s1:,} pred_pairs={sel.height:,} alt_pairs={alt.height:,}")
+    del sel, alt
     gc.collect()
     run.end_stage()
 
@@ -540,10 +659,13 @@ def predict_stage(cfg: Config, run: Run, model_run_dir: Path) -> None:
     test_dir = ROOT / "student_resource" / "dataset" / "test"
     ok = True
     report = []
-    for fn in ("matching_results.tsv", "variants/matching_results_excl.tsv"):
+    for fn in ("matching_results.tsv", "variants/matching_results_alt.tsv"):
+        # --candidate at a missing path: the official validator holds ~70M candidate ids in Python sets (OOM
+        # here); candidate_pairs.tsv gets the streamed polars check below instead
         r = subprocess.run([sys.executable, str(VALIDATOR), "--matching", str(OUTPUT_DIR / fn),
-                            "--test-dir", str(test_dir)],
-                           capture_output=True, text=True, encoding="utf-8", errors="replace")
+                            "--candidate", str(OUTPUT_DIR / "__skip__.tsv"), "--test-dir", str(test_dir)],
+                           capture_output=True, text=True, encoding="utf-8", errors="replace",
+                           env={**os.environ, "PYTHONIOENCODING": "utf-8"})  # validator prints non-cp1252 chars
         report.append(f"== {fn}\n{r.stdout}{r.stderr}")
         tail = (r.stdout.strip().splitlines() or [r.stderr[-300:]])[-1]
         run.log(f"metric validator {fn} exit={r.returncode}: {tail}")
@@ -573,8 +695,10 @@ def submit_stage(run_dir: Path, team: str) -> Path:
 
 # ---------------------------------------------------------------- main
 def main() -> None:
+    for stream in (sys.stdout, sys.stderr):  # Windows console is cp1252: never crash a run on a log line
+        stream.reconfigure(errors="backslashreplace")
     ap = argparse.ArgumentParser()
-    ap.add_argument("cmd", choices=["prep", "train", "predict", "all", "submit", "lb", "stage2"])
+    ap.add_argument("cmd", choices=["prep", "train", "predict", "all", "submit", "lb", "stage2", "decide"])
     ap.add_argument("args", nargs="*")
     ap.add_argument("--sample", type=float, default=1.0)
     ap.add_argument("--name", default=None)
@@ -593,6 +717,10 @@ def main() -> None:
     ap.add_argument("--k-addr", type=int, default=5, help="extra candidates kept by address-key score rank")
     ap.add_argument("--rounds", type=int, default=None, help="override xgb_rounds")
     ap.add_argument("--promote", action="store_true", help="stage2: also write output/matching_results.tsv")
+    ap.add_argument("--no-rr", action="store_true", help="disable the blocking re-ranker (v4 behaviour)")
+    ap.add_argument("--rr-keep", type=int, default=40, help="candidates kept per S1 after re-ranking")
+    ap.add_argument("--rr-wide", default="300,60,60", help="wide retrieval: top_k,k_name,k_addr before re-ranking")
+    ap.add_argument("--rr-fit-s1", type=int, default=5000, help="held-out S1 per country for fitting the re-ranker")
     a = ap.parse_args()
 
     if a.cmd == "lb":
@@ -603,14 +731,15 @@ def main() -> None:
         submit_stage(RUNS_DIR / a.run, a.team)
         return
 
-    cfg = Config(run_name=a.name or (f"s2_{a.run}" if a.cmd == "stage2" else f"dev{a.sample}" if a.sample < 1 else a.cmd),
+    cfg = Config(run_name=a.name or (f"{a.cmd}_{a.run}" if a.cmd in ("stage2", "decide") else f"dev{a.sample}" if a.sample < 1 else a.cmd),
                  sample=a.sample)
     cfg.max_candidates = a.max_cands
     cfg.model, cfg.device, cfg.s1_chunk = a.model, a.device, a.s1_chunk
     if a.rounds:
         cfg.xgb_rounds = a.rounds
     cfg.extra.update(train_max_s1=a.train_max_s1, val_max_s1=a.val_max_s1, max_df=a.max_df, threshold_override=a.threshold,
-                     prep_workers=a.prep_workers, k_name=a.k_name, k_addr=a.k_addr)
+                     prep_workers=a.prep_workers, k_name=a.k_name, k_addr=a.k_addr, use_rr=not a.no_rr,
+                     rr_keep=a.rr_keep, rr_wide=tuple(int(x) for x in a.rr_wide.split(",")), rr_fit_s1=a.rr_fit_s1)
     run = Run(cfg.run_name, cfg.to_dict())
     try:
         with HwMonitor(run.dir / "hw.csv"):
@@ -626,6 +755,15 @@ def main() -> None:
                 predict_stage(cfg, run, RUNS_DIR / a.run)
             if a.cmd == "all":
                 predict_stage(cfg, run, run.dir)
+            if a.cmd == "decide":
+                src = RUNS_DIR / a.run
+                m = json.loads((src / "metrics.json").read_text())
+                dec = {"mode": m.get("decision_mode", "threshold"),
+                       "param": m.get("decision_param", m.get("threshold", 0.5)), "excl": m.get("decision_excl", False)}
+                if a.threshold:
+                    dec = {"mode": "threshold", "param": a.threshold, "excl": dec["excl"]}
+                run.log(f"re-deciding {src.name} pred/ with {dec}")
+                decide_stage(cfg, run, src / "pred", dec)
             if a.cmd == "stage2":
                 from stage2 import run_stage2
                 run_stage2(RUNS_DIR / a.run, run, device=cfg.device, seed=cfg.seed, workers=cfg.n_jobs,

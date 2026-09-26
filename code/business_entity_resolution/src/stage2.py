@@ -165,15 +165,14 @@ def run_stage2(src_dir: Path, run, device: str = "cuda", seed: int = 42, workers
     s2 = base.with_columns(pl.Series("p", oof))
     r2 = pp.tune_decision(s2, tvc, P_MIN, run)
     d2 = max(r2.values(), key=lambda d: d["f05"])
-    ex1 = pp.eval_selection(pp.exclusive(pp.apply_decision(base, d1, P_MIN)), tvc)
-    ex2 = pp.eval_selection(pp.exclusive(pp.apply_decision(s2, d2, P_MIN)), tvc)
-    run.set_metrics(val_f05_s1=round(d1["f05"], 5), val_f05_s1_excl=round(ex1["f05"], 5),
-                    val_f05=round(d2["f05"], 5), val_f05_excl=round(ex2["f05"], 5),
+    run.set_metrics(val_f05_s1=round(d1["f05"], 5), val_f05=round(d2["f05"], 5),
+                    val_f05_by_decision={k: round(v["f05"], 5) for k, v in r2.items()},
                     val_precision=round(d2["precision"], 4), val_recall=round(d2["recall"], 4),
-                    decision_mode=d2["mode"], decision_param=d2["param"], threshold=r2["threshold"]["param"],
-                    s2_rounds=best_iters)
-    run.log(f"metric stage1 val_f05={d1['f05']:.5f} excl={ex1['f05']:.5f} | stage2 OOF val_f05={d2['f05']:.5f} "
-            f"excl={ex2['f05']:.5f} P={d2['precision']:.4f} R={d2['recall']:.4f} decision={d2['mode']}:{d2['param']}")
+                    decision_mode=d2["mode"], decision_param=d2["param"], decision_excl=d2["excl"],
+                    threshold=r2["threshold"]["param"], s2_rounds=best_iters)
+    run.log(f"metric stage1 val_f05={d1['f05']:.5f} ({d1['mode']} excl={d1['excl']}) | stage2 OOF "
+            f"val_f05={d2['f05']:.5f} P={d2['precision']:.4f} R={d2['recall']:.4f} "
+            f"decision={d2['mode']}:{d2['param']} excl={d2['excl']}")
     gain: dict[str, float] = {}
     for b in models:
         for f_, v in b.get_score(importance_type="total_gain").items():
@@ -203,19 +202,18 @@ def run_stage2(src_dir: Path, run, device: str = "cuda", seed: int = 42, workers
     te = te.select("s1_idx", "cand_idx").with_columns(pl.Series("p", p2)).join(cids, on="cand_idx", how="left")
     s1_map = s1n.select("s1_idx", pl.col("entity_id").alias("source1_entity_id"))
     sel = pp.apply_decision(te, d2, P_MIN)
-    excl = pp.exclusive(sel)
+    alt = pp.apply_decision(te, {**d2, "excl": not d2["excl"]}, P_MIN)
     out = run.dir / "output"
     out.mkdir(exist_ok=True)
     pp._write_ids(s1_map, pp._join_ids(sel), "matched_entity_ids", out / "matching_results.tsv")
-    pp._write_ids(s1_map, pp._join_ids(excl), "matched_entity_ids", out / "matching_results_excl.tsv")
+    pp._write_ids(s1_map, pp._join_ids(alt), "matched_entity_ids", out / "matching_results_alt.tsv")
     (OUTPUT_DIR / "variants").mkdir(exist_ok=True)
     shutil.copy(out / "matching_results.tsv", OUTPUT_DIR / "variants" / "matching_results_s2.tsv")
-    shutil.copy(out / "matching_results_excl.tsv", OUTPUT_DIR / "variants" / "matching_results_s2_excl.tsv")
+    shutil.copy(out / "matching_results_alt.tsv", OUTPUT_DIR / "variants" / "matching_results_s2_alt.tsv")
     if promote:
         shutil.copy(out / "matching_results.tsv", OUTPUT_DIR / "matching_results.tsv")
-    run.set_metrics(test_decision=f"{d2['mode']}:{d2['param']}", test_s1=s1_map.height,
-                    test_nonempty=sel["s1_idx"].n_unique(), test_pred_pairs=sel.height,
-                    test_pred_pairs_excl=excl.height, test_excl_dropped=sel.height - excl.height)
+    run.set_metrics(test_decision=f"{d2['mode']}:{d2['param']} excl={d2['excl']}", test_s1=s1_map.height,
+                    test_nonempty=sel["s1_idx"].n_unique(), test_pred_pairs=sel.height, test_pred_pairs_alt=alt.height)
     run.log(f"metric test nonempty={sel['s1_idx'].n_unique():,}/{s1_map.height:,} pred_pairs={sel.height:,} "
-            f"excl_dropped={sel.height - excl.height:,}")
+            f"alt_pairs={alt.height:,}")
     run.end_stage()

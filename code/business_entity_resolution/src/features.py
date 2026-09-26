@@ -21,7 +21,13 @@ FEATURES = [
     "bname", "baddr", "bname_norm", "baddr_norm", "brank_name", "brank_addr",
     "ncc_ratio", "ncc_partial", "nsk_ratio", "nsk_tset", "hn_eq", "hn_both",
     "c_name_cnt", "s1_name_cnt", "s1_same_name", "c_name_ratio", "nc_tset_gap", "ad_tset_gap",
+    # v5: blocking re-ranker score/rank, fuzzy house number (8250~8252 is a typo, 33 vs 46 a different
+    # building), S1 initials as prefix of a handle-style candidate ("lex communication" -> "lcprivate")
+    "rr", "rr_rank", "hn_sim", "hn_prefix", "init_pref",
 ]
+# re-ranker inputs: blocking scores + three cheap fuzzy sims (see rerank_sims)
+RR_FEATURES = ["bscore", "bscore_norm", "bname", "baddr", "bname_norm", "baddr_norm", "brank", "brank_name",
+               "brank_addr", "r_cc_ratio", "r_nf_part", "r_ad_tset"]
 # per-record name frequencies within the country, attached by add_name_counts (pool / S1 side)
 CNT_COLS = ["ncnt_pool", "ncnt_s1"]
 _HOUSE_NO = r"\b(\d+)"
@@ -50,6 +56,22 @@ def add_name_counts(frames: list[pl.DataFrame], pool: pl.DataFrame, s1_all: pl.L
     return [f.join(pc, on="name_core", how="left", maintain_order="left")
             .join(sc, on="name_core", how="left", maintain_order="left")
             .with_columns(pl.col(CNT_COLS).fill_null(0.0)) for f in frames]
+
+
+def rerank_sims(pairs: pl.DataFrame, s1: pl.DataFrame, pool: pl.DataFrame, workers: int = -1) -> pl.DataFrame:
+    """Adds r_cc_ratio (compact name), r_nf_part (full name partial), r_ad_tset (address token set) to
+    wide blocking output. Cheap enough for ~350 candidates per S1."""
+    cols = ["idx", "name_core", "name_full", "addr"]
+    a = pairs.join(s1.select(cols).rename({c: c + "_1" for c in cols}),
+                   left_on="s1_idx", right_on="idx_1", how="left", maintain_order="left")
+    a = a.join(pool.select(cols).rename({c: c + "_2" for c in cols}),
+               left_on="cand_idx", right_on="idx_2", how="left", maintain_order="left")
+    g = lambda c: a[c].fill_null("").to_list()  # noqa: E731
+    cc = lambda c: a[c].fill_null("").str.replace_all(" ", "", literal=True).to_list()  # noqa: E731
+    return pairs.with_columns(
+        pl.Series("r_cc_ratio", _pair_scores(cc("name_core_1"), cc("name_core_2"), fuzz.ratio, workers)),
+        pl.Series("r_nf_part", _pair_scores(g("name_full_1"), g("name_full_2"), fuzz.partial_ratio, workers)),
+        pl.Series("r_ad_tset", _pair_scores(g("addr_1"), g("addr_2"), fuzz.token_set_ratio, workers)))
 
 
 def build_features(pairs: pl.DataFrame, s1: pl.DataFrame, pool: pl.DataFrame, workers: int = -1) -> pl.DataFrame:
@@ -83,9 +105,22 @@ def build_features(pairs: pl.DataFrame, s1: pl.DataFrame, pool: pl.DataFrame, wo
     }
     num_j, num_b = _jacc(g("addr_nums_1"), g("addr_nums_2"))
     f["num_jacc"], f["num_both"] = num_j, num_b
-    feats = a.select("s1_idx", "cand_idx", "bscore", "bscore_norm", "brank", "bname", "baddr", "bname_norm",
-                     "baddr_norm", "brank_name", "brank_addr").with_columns([pl.Series(k, v) for k, v in f.items()])
     hn1, hn2 = a["addr_1"].str.extract(_HOUSE_NO, 1), a["addr_2"].str.extract(_HOUSE_NO, 1)
+    f["hn_sim"] = _pair_scores(hn1.fill_null("").to_list(), hn2.fill_null("").to_list(), fuzz.ratio, workers)
+    feats = a.select("s1_idx", "cand_idx", "bscore", "bscore_norm", "brank", "bname", "baddr", "bname_norm",
+                     "baddr_norm", "brank_name", "brank_addr", "rr", "rr_rank"
+                     ).with_columns([pl.Series(k, v) for k, v in f.items()])
+    h = pl.DataFrame({"h1": hn1, "h2": hn2, "n1": a["name_core_1"].fill_null(""),
+                      "c2": a["name_core_2"].fill_null("").str.replace_all(" ", "", literal=True)})
+    h = h.with_columns(pl.col("n1").str.split(" ").list.eval(pl.element().str.slice(0, 1)).list.join("").alias("i1"))
+    extra = h.select(
+        # one house number is a prefix of the other (27724 -> 2772, 175 -> 17): truncation noise
+        (pl.col("h1").is_not_null() & pl.col("h2").is_not_null() & (pl.col("h1") != pl.col("h2"))
+         & (pl.col("h1").str.starts_with(pl.col("h2")) | pl.col("h2").str.starts_with(pl.col("h1"))))
+        .fill_null(False).cast(pl.Float32).alias("hn_prefix"),
+        ((pl.col("i1").str.len_chars() >= 2) & (pl.col("i1").str.len_chars() < pl.col("n1").str.len_chars())
+         & pl.col("c2").str.starts_with(pl.col("i1"))).fill_null(False).cast(pl.Float32).alias("init_pref"))
+    feats = feats.with_columns(extra["hn_prefix"], extra["init_pref"])
     feats = feats.with_columns(
         (a["name_core_1"].str.split(" ").list.first() == a["name_core_2"].str.split(" ").list.first())
         .cast(pl.Float32).alias("nc_first_eq"),

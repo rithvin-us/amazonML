@@ -475,9 +475,15 @@ async function pollHW(){
 }
 $("runSel").addEventListener("change", e => { selectedRun = e.target.value || null; pollState(); });
 window.addEventListener("resize", () => { drawRunCharts(); drawLive(); });
-pollState(); pollHW();
-setInterval(pollState, 3000);
-setInterval(pollHW, 2000);
+// self-scheduling loops: next poll only after the previous one finished (no request pile-up when the
+// machine is loaded), and no polling at all while the tab is hidden
+function loop(fn, ms){
+  const tick = async () => { if (!document.hidden) await fn(); setTimeout(tick, ms); };
+  tick();
+}
+document.addEventListener("visibilitychange", () => { if (!document.hidden){ pollState(); pollHW(); } });
+loop(pollState, 5000);
+loop(pollHW, 3000);
 </script>
 </body>
 </html>

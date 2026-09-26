@@ -18,7 +18,8 @@ LEGAL = {
     "private": "pvt", "pvt": "pvt", "pvt.": "pvt", "pte": "pvt",
     "limited": "ltd", "ltd": "ltd", "ltd.": "ltd", "llp": "llp", "llc": "llc", "l.l.c": "llc",
     "incorporated": "inc", "inc": "inc", "corporation": "corp", "corp": "corp", "co": "co",
-    "company": "co", "compny": "co", "plc": "plc", "lp": "lp",
+    "company": "co", "compny": "co", "plc": "plc", "lp": "lp", "cie": "co", "compagnie": "co",
+    "ets": "ets", "etablissements": "ets",
     # french / eu
     "sarl": "sarl", "sas": "sas", "sasu": "sas", "sa": "sa", "eurl": "eurl", "sci": "sci",
     "societe": "ste", "ste": "ste", "gmbh": "gmbh", "bv": "bv", "srl": "srl",
@@ -40,7 +41,7 @@ ADDR = {
     "faubourg": "fbg", "fbg": "fbg", "quai": "qu", "cours": "crs", "square": "sq", "sq": "sq",
     "residence": "res", "res": "res", "batiment": "bat", "bat": "bat", "appartement": "apt",
     "etage": "fl", "centre": "ctr", "center": "ctr", "ctr": "ctr", "saint": "st", "sainte": "ste",
-    "null": "", "none": "",
+    "null": "", "none": "", "ndeg": "",  # unidecode("n°") -> "ndeg"
     # ordinal words -> bare numbers (numeric ordinals are stripped of st/nd/rd/th in _addr_tok)
     "first": "1", "second": "2", "third": "3", "fourth": "4", "fifth": "5", "sixth": "6",
     "seventh": "7", "eighth": "8", "ninth": "9", "tenth": "10",

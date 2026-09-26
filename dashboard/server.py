@@ -1,6 +1,7 @@
 import csv
 import json
 import sys
+import time
 from collections import deque
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -80,6 +81,20 @@ def state(rid):
     }
 
 
+_CACHE = {}
+
+
+def cached(key, ttl, fn):
+    """One computation per ttl seconds, however many tabs poll (nvidia-smi spawns are the costly part)."""
+    now = time.monotonic()
+    hit = _CACHE.get(key)
+    if hit and now - hit[0] < ttl:
+        return hit[1]
+    val = fn()
+    _CACHE[key] = (now, val)
+    return val
+
+
 def hw_now():
     try:
         from hwmon import sample, COLS
@@ -110,9 +125,10 @@ class H(BaseHTTPRequestHandler):
                 self.send(200, INDEX.read_bytes(), "text/html; charset=utf-8")
             elif u.path == "/api/state":
                 q = parse_qs(u.query)
-                self.send_json(state((q.get("run") or [None])[0]))
+                rid = (q.get("run") or [None])[0]
+                self.send_json(cached(("state", rid), 4.0, lambda: state(rid)))
             elif u.path == "/api/hw_now":
-                self.send_json(hw_now())
+                self.send_json(cached("hw", 3.0, hw_now))
             else:
                 self.send(404, b"not found", "text/plain")
         except Exception as e:

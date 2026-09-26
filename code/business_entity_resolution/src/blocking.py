@@ -23,7 +23,10 @@ Unknown/unseen countries work unchanged — they just get their own index.
 """
 from __future__ import annotations
 
+import json
 import math
+import shutil
+from pathlib import Path
 
 import numpy as np
 import polars as pl
@@ -31,6 +34,8 @@ import polars as pl
 KEY_WEIGHTS = {"n": 1.0, "b": 1.0, "p": 0.5, "a": 0.4, "z": 1.5, "c": 0.8, "x": 1.0, "k": 0.8, "e": 1.5, "s": 0.5}
 _SEED = {"n": 11, "b": 23, "p": 37, "a": 53, "z": 71, "c": 89, "x": 97, "k": 101, "e": 103, "s": 107}
 CHANNEL = {**{t: 0 for t in "nbpkes"}, **{t: 1 for t in "azcx"}}  # 0 = name, 1 = address
+BLOCK_VERSION = 3  # bump whenever build_keys key definitions change (invalidates cache/index/*)
+_ARRAYS = ("keys", "idf", "offsets", "cands")
 NUM = r"^\d+[a-z]?$"
 
 
@@ -115,11 +120,45 @@ class BlockIndex:
             fill[kid[first]] += run_len
         self.n_postings = len(self.cands)
 
+    def save(self, d: Path) -> None:
+        tmp = d.with_name(d.name + ".tmp")
+        shutil.rmtree(tmp, ignore_errors=True)
+        tmp.mkdir(parents=True)
+        for a in _ARRAYS:
+            np.save(tmp / f"{a}.npy", getattr(self, a))
+        (tmp / "meta.json").write_text(json.dumps({"n_keys_total": self.n_keys_total, "idx_dtype": str(self.idx_dtype)}))
+        tmp.rename(d)
+
+    @classmethod
+    def load(cls, d: Path) -> "BlockIndex":
+        """Memory-mapped arrays: file-backed pages, so they do not count against the RAM commit limit."""
+        self = cls.__new__(cls)
+        for a in _ARRAYS:
+            setattr(self, a, np.load(d / f"{a}.npy", mmap_mode="r"))
+        meta = json.loads((d / "meta.json").read_text())
+        self.n_keys_total, self.idx_dtype = meta["n_keys_total"], getattr(pl, meta["idx_dtype"])
+        self.n_postings = len(self.cands)
+        return self
+
+    @classmethod
+    def cached(cls, pool: pl.DataFrame, d: Path, max_df: int, chunk: int) -> tuple["BlockIndex", bool]:
+        """Load the index from d if present, else build, save and reload it memory-mapped. -> (index, cache_hit)."""
+        if not (d / "meta.json").exists():
+            ix = cls(pool, max_df=max_df, chunk=chunk)
+            ix.save(d)
+            del ix
+            return cls.load(d), False
+        return cls.load(d), True
+
     def _lookup(self, qk: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
         """hashed keys -> (key id, found mask) via binary search over the sorted kept keys."""
         if not len(self.keys):
             return np.zeros(len(qk), np.int64), np.zeros(len(qk), bool)
-        pos = np.searchsorted(self.keys, qk)
+        # sorted needles -> numpy's binary search reuses the previous bound (cache friendly); random-order
+        # needles into a multi-million key array were ~10x slower and dominated index build time
+        order = np.argsort(qk, kind="stable")
+        pos = np.empty(len(qk), np.int64)
+        pos[order] = np.searchsorted(self.keys, qk[order])
         pos[pos >= len(self.keys)] = 0
         return pos, self.keys[pos] == qk
 
