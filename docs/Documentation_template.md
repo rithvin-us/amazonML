@@ -9,7 +9,7 @@
 ## 1. Executive Summary
 A two-stage *learned blocking* pipeline feeds a gradient-boosted matcher. Blocking retrieves a wide candidate
 pool from an IDF-weighted inverted index over hashed name and address keys, then a small XGBoost re-ranker
-keeps only a handful of candidates per Source 1 record (11.6 on average on test, down from ~350 retrieved)
+keeps only a handful of candidates per Source 1 record (11.2 on average on test, down from ~350 retrieved)
 while keeping ~98.5% of true matches. The matcher combines ~70 pairwise and **group-consensus** features (does
 this candidate agree with the S1's other strongest candidates?); a fine-tuned MiniLM cross-encoder re-scores
 only the uncertain pairs, and a decision rule is tuned for macro F0.5 under the one-owner-per-record structure
@@ -44,7 +44,9 @@ with *competitor* S1s so validation sees the same record-ownership competition a
 ---
 
 ## 3. Candidate Generation (Blocking)
-1. **Normalisation** (`normalize.py`): Unicode NFKC + transliteration (Devanagari via a dictionary learned from
+1. **Normalisation** (`normalize.py`): look-alike digits inside name words are mapped back to letters
+   (`5atguru`→`satguru`, `8ashaw`→`bashaw`, `cu1tural`→`cultural`; real numbers such as `shop15` stay), then
+   Unicode NFKC + transliteration (Devanagari via a dictionary learned from
    train ground truth, accents stripped), legal-form canonicalisation (`private limited→pvt ltd`,
    `sasu→sas`), address abbreviation maps (`road→rd`, `r./rue`, `allée→all`), state/region codes, postcode and
    house-number extraction. Output: `name_full`, `name_core` (no legal/stop words), `name_skel` (consonant
@@ -62,12 +64,12 @@ with *competitor* S1s so validation sees the same record-ownership competition a
 
 - **Blocking keys used:** name tokens / bigrams / prefixes / skeleton, compact name, address tokens and token
   pairs, postcode, name-token × house number; learned re-ranking on top.
-- **Candidate pairs generated:** 20,063,811 on test = 11.58 per S1 (was 69.2M / 39.9 per S1 with a fixed
-  top-40); 9.3 per S1 on validation.
+- **Candidate pairs generated:** 19,481,044 on test = 11.24 per S1 (was 69.2M / 39.9 per S1 with a fixed
+  top-40); 9.0 per S1 on validation.
 - **How true matches were not lost:** two independent channels (name-only and address-only extras) so records
   with an empty address or a renamed business still enter the wide pool; the re-ranker is judged on recall of
   the wide pool; validation recall is tracked for every run (0.9645 plain IDF top-40 → 0.9875 re-ranked top-40
-  → 0.9853 with the adaptive candidate set at 9.3 per S1).
+  → 0.9855 with the adaptive candidate set at 9.0 per S1).
 
 ---
 
@@ -87,11 +89,12 @@ with *competitor* S1s so validation sees the same record-ownership competition a
   and this one does not), candidates per S1, gaps to the S1's best, within-S1 ranks of key similarities.
 
 **Model type:** XGBoost (`hist`, CUDA), depth 8, learning rate 0.05, early stopping on a 5% holdout of the
-training S1 by log-loss (the decision relies on calibrated probabilities), trained on 700k S1 (6.2M pairs).
+training S1 by log-loss (the decision relies on calibrated probabilities), trained on 1.6M S1 (14.3M pairs),
+up to 6,000 rounds (best iteration 5,437).
 Training data is streamed from per-chunk parquet files into a `QuantileDMatrix`.
 
 **Stage 3 — cross-encoder on the uncertain band:** `cross-encoder/ms-marco-MiniLM-L6-v2` (Apache-2.0, 22M
-parameters) fine-tuned for 2 epochs on 600k training pairs ("name | address" of S1 vs candidate, balanced
+parameters; the L12 variant, 33M parameters, in the final run) fine-tuned for 2 epochs on 1M training pairs ("name | address" of S1 vs candidate, balanced
 positives / hard negatives). It re-scores only pairs with stage-1 probability in [0.02, 0.995) — 2.7M of the
 20.1M test pairs — and a monotone depth-3 XGBoost stacks [logit p, cross-encoder logit] (fit on the validation
 band with out-of-fold estimates by block). Band AUC: stage-1 0.952, cross-encoder 0.944, stacked 0.969.
@@ -115,9 +118,11 @@ exclusivity acts as it does on the full test set.
 | v6 | group-consensus + sharper pair features, competitor-aware tuning | 0.9812 | – |
 | v6 + CE | cross-encoder on the uncertain band | 0.9839 | _pending_ |
 | v7 | adaptive candidates (11.6/S1 on test), 700k training S1 | 0.9822 | – |
-| **v7 + CE** | **final pipeline** | **0.9846** | _pending_ |
+| v7 + CE | cross-encoder MiniLM-L6 | 0.9846 | 0.9739 |
+| v8 + CE | 1.3M training S1, MiniLM-L12 | 0.9852 | – |
+| **v9 + CE** | **final: look-alike digit normalisation, 1.6M S1, L12 on 1M pairs, unlabelled-country decision** | **0.9859** | _pending_ |
 
-- **F_0.5 Score (macro):** 0.9846 on validation (40k block-sampled train S1 never used for training, decision
+- **F_0.5 Score (macro):** 0.9859 on validation (40k block-sampled train S1 never used for training, decision
   tuned with competitor S1); v6 onwards numbers include competitor-aware tuning.
 - **Common false positives (wrong merges):** "nudged copies" — same name with the house number moved by a few
   units (`1305` vs `1318 pacific ave`) or one name word swapped (`medical`/`media`), usually in the same city.
@@ -143,7 +148,11 @@ nudged distractors. Everything runs on a 16 GB laptop by streaming per country a
 `tracking.py`, `hwmon.py`. `prep` → `train` → `predict --run <train_run_id>` regenerates both output files.
 
 ### B. Additional Results
-- Final candidate set on test: 20,063,811 pairs (11.58 per S1; 2 S1 with no candidates).
+- Final candidate set on test: 19,481,044 pairs (11.24 per S1; 2 S1 with no candidates).
+- Unseen country (France): with the validation-tuned threshold the model predicts 3.44 matches per France S1
+  against 3.36 for US/India (the generator's match-count distribution is identical across training countries),
+  i.e. it over-matches. For any country without validation labels the decision picks the threshold at which its
+  matches per S1 equal the labelled countries' (France: 0.895 after the cross-encoder).
 - Validation blocking recall by stage: IDF top-40 0.9645 · re-ranked top-40 0.9875 · adaptive (~9) ~0.984.
 - Loss breakdown (v6 validation, F0.5 points lost): model misses 0.0077, S1 with zero correct matches
   0.0044, false positives 0.0039, blocking misses 0.0034, singleton false positives 0.0009.

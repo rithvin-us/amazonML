@@ -29,7 +29,7 @@ Run from the repo root. `SRC=code/business_entity_resolution/src`.
 python $SRC/pipeline.py prep --prep-workers 4
 
 # 2. train: fit blocking re-ranker, block + featurise train S1, train matcher, tune decision on validation
-python $SRC/pipeline.py train --name final --train-max-s1 700000 --max-df 600 \
+python $SRC/pipeline.py train --name final --train-max-s1 1600000 --max-df 600 --rounds 6000 \
        --rr-fit-s1 15000 --rr-tau 0.002 --rr-min 3
 
 # 3. predict test with that run's model + re-ranker + tuned decision; writes and validates
@@ -40,8 +40,9 @@ python $SRC/pipeline.py predict --run <train_run_id> --name final_test --max-df 
 ```
 # 4. stage 3: cross-encoder on the uncertain band (one-time download of the Apache-2.0 base model, 90 MB;
 #    after that everything runs offline)
-python -c "from huggingface_hub import snapshot_download as s; s('cross-encoder/ms-marco-MiniLM-L6-v2')"
-python $SRC/pipeline.py ce-train --run <train_run_id> --name final_cetrain      # -> models/ce_<train_run_id>
+python -c "from huggingface_hub import snapshot_download as s; s('cross-encoder/ms-marco-MiniLM-L12-v2')"
+python $SRC/pipeline.py ce-train --run <train_run_id> --name final_cetrain \
+       --ce-base cross-encoder/ms-marco-MiniLM-L12-v2 --ce-pairs 1000000 --ce-epochs 2   # -> models/ce_<train_run_id>
 # ce-apply reads val scores from <train_run_id> and test scores from --feats-run (the predict run's pred/)
 python $SRC/pipeline.py ce-apply --run <train_run_id> --feats-run <predict_run_id> --name final_ce
 ```
