@@ -1,0 +1,17 @@
+# Python 3.11.9 (Windows 11, tested). GPU optional: XGBoost falls back to CPU when CUDA is unavailable.
+polars==1.44.2
+pyarrow==25.0.1
+numpy==2.4.6
+RapidFuzz==3.14.6
+Unidecode==1.4.0
+xgboost==3.2.0
+psutil==7.2.2
+scikit-learn==1.9.1
+# stage 3 cross-encoder (ce-train / ce-apply). CUDA wheel: pip install torch==2.14.0 --index-url https://download.pytorch.org/whl/cu126
+torch==2.14.0
+transformers==5.17.0
+tokenizers==0.23.2
+safetensors==0.8.0
+huggingface_hub==1.33.0
+# optional: --model lgb (CPU LightGBM instead of XGBoost)
+lightgbm==4.7.0

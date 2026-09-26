@@ -38,7 +38,8 @@ FEATURES = [
 N_ANCHORS = 3
 # re-ranker inputs: blocking scores + three cheap fuzzy sims (see rerank_sims)
 RR_FEATURES = ["bscore", "bscore_norm", "bname", "baddr", "bname_norm", "baddr_norm", "brank", "brank_name",
-               "brank_addr", "r_cc_ratio", "r_nf_part", "r_ad_tset"]
+               "brank_addr", "r_cc_ratio", "r_nf_part", "r_ad_tset", "r_nc_tset", "r_hn_eq"]
+# a saved re-ranker scores with the feature names it was trained on (older ones lack r_nc_tset / r_hn_eq)
 # per-record name frequencies within the country, attached by add_name_counts (pool / S1 side)
 CNT_COLS = ["ncnt_pool", "ncnt_s1"]
 _HOUSE_NO = r"\b(\d+)"
@@ -93,10 +94,15 @@ def rerank_sims(pairs: pl.DataFrame, s1: pl.DataFrame, pool: pl.DataFrame, worke
                left_on="cand_idx", right_on="idx_2", how="left", maintain_order="left")
     g = lambda c: a[c].fill_null("").to_list()  # noqa: E731
     cc = lambda c: a[c].fill_null("").str.replace_all(" ", "", literal=True).to_list()  # noqa: E731
+    hn = pl.DataFrame({"h1": a["addr_1"].str.extract(_HOUSE_NO, 1), "h2": a["addr_2"].str.extract(_HOUSE_NO, 1)})
+    hn_eq = hn.select(pl.when(pl.col("h1").is_not_null() & pl.col("h2").is_not_null())  # null = unknown
+                      .then((pl.col("h1") == pl.col("h2")).cast(pl.Float32)).alias("r_hn_eq"))["r_hn_eq"]
     return pairs.with_columns(
         pl.Series("r_cc_ratio", _pair_scores(cc("name_core_1"), cc("name_core_2"), fuzz.ratio, workers)),
         pl.Series("r_nf_part", _pair_scores(g("name_full_1"), g("name_full_2"), fuzz.partial_ratio, workers)),
-        pl.Series("r_ad_tset", _pair_scores(g("addr_1"), g("addr_2"), fuzz.token_set_ratio, workers)))
+        pl.Series("r_ad_tset", _pair_scores(g("addr_1"), g("addr_2"), fuzz.token_set_ratio, workers)),
+        pl.Series("r_nc_tset", _pair_scores(g("name_core_1"), g("name_core_2"), fuzz.token_set_ratio, workers)),
+        hn_eq)
 
 
 def _anchor_features(a: pl.DataFrame, hn2: pl.Series, workers: int) -> pl.DataFrame:

@@ -25,6 +25,7 @@ from pathlib import Path
 
 import numpy as np
 import polars as pl
+import polars.selectors as cs
 import psutil
 
 from blocking import BLOCK_VERSION, BlockIndex
@@ -88,8 +89,15 @@ def country_index(split: str, c: str, pool_c: pl.DataFrame, cfg: Config) -> tupl
                              chunk=cfg.extra.get("index_chunk", 100_000))  # smaller key batches = lower peak RAM
 
 
-def _rr_matrix(w: pl.DataFrame) -> np.ndarray:
-    return w.select(pl.col(RR_FEATURES).cast(pl.Float32).fill_null(-1.0)).to_numpy()
+def _rr_matrix(w: pl.DataFrame, names: list[str] | None = None) -> np.ndarray:
+    return w.select(pl.col(names or RR_FEATURES).cast(pl.Float32).fill_null(-1.0)).to_numpy()
+
+
+def rr_keep_expr(cfg: Config) -> pl.Expr:
+    """Final candidate set = what the matching model scores (candidate_pairs.tsv). Adaptive: the top rr_min
+    by re-ranker score always, then any candidate with rr >= rr_tau, capped at rr_keep. rr_tau=0 -> plain top-K."""
+    keep, kmin, tau = cfg.extra.get("rr_keep", 40), cfg.extra.get("rr_min", 3), cfg.extra.get("rr_tau", 0.0)
+    return (pl.col("rr_rank") <= keep) & ((pl.col("rr_rank") <= kmin) | (pl.col("rr") >= tau))
 
 
 def wide_query(index: BlockIndex, s1: pl.DataFrame, pool_c: pl.DataFrame, cfg: Config) -> pl.DataFrame:
@@ -129,11 +137,14 @@ def fit_reranker(cfg: Config, run: Run, s1_ids: pl.Series, gt: pl.DataFrame):
     bst.save_model(str(run.dir / "reranker.json"))
     d = d.with_columns(pl.Series("rr", bst.predict(xgb.DMatrix(_rr_matrix(d), feature_names=RR_FEATURES))))
     d = d.with_columns(pl.col("rr").rank("ordinal", descending=True).over("s1_idx").alias("rr_rank"))
-    keep = cfg.extra.get("rr_keep", 40)
+    kept = d.with_columns(pl.col("rr").cast(pl.Float32), pl.col("rr_rank").cast(pl.Float32)).filter(rr_keep_expr(cfg))
     wide_r = d["label"].sum() / max(n_true, 1)
-    kept_r = d.filter(pl.col("rr_rank") <= keep)["label"].sum() / max(n_true, 1)
-    run.log(f"metric reranker (in-sample) wide recall={wide_r:.4f} top{keep} recall={kept_r:.4f} on {n_true:,} true pairs")
-    run.set_metrics(rr_wide_recall=round(float(wide_r), 4), rr_keep_recall_insample=round(float(kept_r), 4))
+    kept_r = kept["label"].sum() / max(n_true, 1)
+    per_s1 = kept.height / max(d["s1_idx"].n_unique(), 1)
+    run.log(f"metric reranker (in-sample) wide recall={wide_r:.4f} kept recall={kept_r:.4f} at {per_s1:.1f} cands/S1 "
+            f"on {n_true:,} true pairs")
+    run.set_metrics(rr_wide_recall=round(float(wide_r), 4), rr_keep_recall_insample=round(float(kept_r), 4),
+                    rr_cands_per_s1_insample=round(per_s1, 2))
     return bst
 
 
@@ -151,15 +162,16 @@ def load_reranker(run_dir: Path, device: str):
 def rerank_query(index: BlockIndex, part: pl.DataFrame, pool_c: pl.DataFrame, reranker, cfg: Config) -> pl.DataFrame:
     """Wide retrieval -> re-ranker score rr -> keep top rr_keep per S1 (in sub-chunks: ~350 cands per S1)."""
     import xgboost as xgb
-    keep, sub, out = cfg.extra.get("rr_keep", 40), cfg.extra.get("rr_sub", 2500), []
+    sub, out = cfg.extra.get("rr_sub", 2500), []
     for j in range(0, part.height, sub):
         w = wide_query(index, part.slice(j, sub), pool_c, cfg)
         if not w.height:
             continue
-        w = (w.with_columns(pl.Series("rr", reranker.predict(xgb.DMatrix(_rr_matrix(w), feature_names=RR_FEATURES)),
+        names = reranker.feature_names or RR_FEATURES
+        w = (w.with_columns(pl.Series("rr", reranker.predict(xgb.DMatrix(_rr_matrix(w, names), feature_names=names)),
                                       dtype=pl.Float32))
              .with_columns(pl.col("rr").rank("ordinal", descending=True).over("s1_idx").cast(pl.Float32).alias("rr_rank"))
-             .filter(pl.col("rr_rank") <= keep).drop("r_cc_ratio", "r_nf_part", "r_ad_tset"))
+             .filter(rr_keep_expr(cfg)).drop(cs.starts_with("r_")))
         out.append(w)
     if not out:
         return index.query(part.slice(0, 0)).with_columns(pl.lit(None, pl.Float32).alias("rr"),
@@ -637,20 +649,50 @@ def predict_stage(cfg: Config, run: Run, model_run_dir: Path) -> None:
     spill.mkdir()
     run.start_stage("blocking+features+predict_test")
     n_pairs = part_no = 0
+    fdir = run.dir / "test_feats" if cfg.extra.get("save_test_feats") else None
+    if fdir:
+        fdir.mkdir(exist_ok=True)
     for c, part, pool_c, feats in iter_country_blocks("test", s1, cfg, run, reranker):
-        p = model.predict(feats.select(FEATURES).to_numpy())
-        f = (feats.select("s1_idx", "cand_idx", "brank").with_columns(pl.Series("p", p, dtype=pl.Float32))
-             .join(pool_c.select(pl.col("idx").alias("cand_idx"), pl.col("entity_id").alias("cid")), on="cand_idx"))
-        n_pairs += f.height
-        (f.sort(["s1_idx", "brank"]).group_by("s1_idx", maintain_order=True)
-         .agg(pl.col("cid").str.join(",").alias("ids")).write_parquet(spill / f"cand-{part_no:05d}.parquet"))
-        f.filter(pl.col("p") >= cfg.p_floor).select("s1_idx", "cand_idx", "cid", "p").write_parquet(
-            spill / f"scored-{part_no:05d}.parquet")
+        feats = feats.join(pool_c.select(pl.col("idx").alias("cand_idx"), pl.col("entity_id").alias("cid")), on="cand_idx")
+        if fdir:  # lets `rescore` apply any later model to the same test candidates in minutes
+            feats.select("s1_idx", "cand_idx", "cid", *FEATURES).write_parquet(fdir / f"part-{part_no:05d}.parquet")
+        n_pairs += _spill_scored(feats, model, spill, part_no, cfg.p_floor)
         part_no += 1
-        del p, f, feats
+        del feats
     run.end_stage()
     del s1
     gc.collect()
+    decide_stage(cfg, run, spill, dec, n_pairs)
+
+
+def _spill_scored(feats: pl.DataFrame, model: Model, spill: Path, part_no: int, p_floor: float) -> int:
+    """Score one chunk; write its candidate lists (cand-*) and p >= floor pairs (scored-*) to the spill dir."""
+    f = feats.select("s1_idx", "cand_idx", "cid", "brank").with_columns(
+        pl.Series("p", model.predict(feats.select(FEATURES).to_numpy()), dtype=pl.Float32))
+    (f.sort(["s1_idx", "brank"]).group_by("s1_idx", maintain_order=True)
+     .agg(pl.col("cid").str.join(",").alias("ids")).write_parquet(spill / f"cand-{part_no:05d}.parquet"))
+    f.filter(pl.col("p") >= p_floor).select("s1_idx", "cand_idx", "cid", "p").write_parquet(
+        spill / f"scored-{part_no:05d}.parquet")
+    return f.height
+
+
+def rescore_stage(cfg: Config, run: Run, model_run_dir: Path, feats_run_dir: Path) -> None:
+    """Score saved test features (another run's test_feats/, same FEATURES) with model_run_dir's model + decision."""
+    metrics = json.loads((model_run_dir / "metrics.json").read_text())
+    dec = {"mode": metrics.get("decision_mode", "threshold"),
+           "param": metrics.get("decision_param", metrics.get("threshold", 0.5)), "excl": metrics.get("decision_excl", False)}
+    model = Model.load(model_run_dir, cfg.device)
+    run.log(f"rescoring {feats_run_dir.name}/test_feats with {model_run_dir.name} ({model.kind}), decision {dec}")
+    spill = run.dir / "pred"
+    shutil.rmtree(spill, ignore_errors=True)
+    spill.mkdir()
+    run.start_stage("rescore_test")
+    parts = sorted((feats_run_dir / "test_feats").glob("part-*.parquet"))
+    n_pairs = 0
+    for i, fp in enumerate(parts):
+        n_pairs += _spill_scored(pl.read_parquet(fp), model, spill, i, cfg.p_floor)  # brank is a saved FEATURE
+        run.progress((i + 1) / len(parts), f"{i + 1}/{len(parts)} parts")
+    run.end_stage()
     decide_stage(cfg, run, spill, dec, n_pairs)
 
 
@@ -716,7 +758,7 @@ def decide_stage(cfg: Config, run: Run, spill: Path, dec: dict, n_pairs: int | N
 # ---------------------------------------------------------------- submit zip
 def submit_stage(run_dir: Path, team: str) -> Path:
     zpath = ROOT / f"{team}_submission.zip"
-    doc = ROOT / "student_resource" / "Documentation_template.md"
+    doc = ROOT / "docs" / "Documentation_template.md"  # the filled-in methodology document
     with zipfile.ZipFile(zpath, "w", zipfile.ZIP_DEFLATED) as z:
         for fn in ("matching_results.tsv", "candidate_pairs.tsv"):
             z.write(run_dir / "output" / fn, f"output/{fn}")
@@ -733,7 +775,7 @@ def main() -> None:
     for stream in (sys.stdout, sys.stderr):  # Windows console is cp1252: never crash a run on a log line
         stream.reconfigure(errors="backslashreplace")
     ap = argparse.ArgumentParser()
-    ap.add_argument("cmd", choices=["prep", "train", "predict", "all", "submit", "lb", "stage2", "decide"])
+    ap.add_argument("cmd", choices=["prep", "train", "predict", "all", "submit", "lb", "stage2", "decide", "rescore", "ce-train", "ce-apply"])
     ap.add_argument("args", nargs="*")
     ap.add_argument("--sample", type=float, default=1.0)
     ap.add_argument("--name", default=None)
@@ -756,6 +798,13 @@ def main() -> None:
     ap.add_argument("--rr-keep", type=int, default=40, help="candidates kept per S1 after re-ranking")
     ap.add_argument("--rr-wide", default="300,60,60", help="wide retrieval: top_k,k_name,k_addr before re-ranking")
     ap.add_argument("--rr-fit-s1", type=int, default=5000, help="held-out S1 per country for fitting the re-ranker")
+    ap.add_argument("--rr-tau", type=float, default=0.0, help="keep candidates with re-ranker score >= tau (0 = top-K)")
+    ap.add_argument("--rr-min", type=int, default=3, help="always keep this many top re-ranked candidates")
+    ap.add_argument("--ce-pairs", type=int, default=600_000, help="ce-train: training pairs")
+    ap.add_argument("--ce-epochs", type=int, default=2, help="ce-train: epochs")
+    ap.add_argument("--ce-dir", default=None, help="ce-apply: fine-tuned model dir (default models/ce_<run>)")
+    ap.add_argument("--save-test-feats", action="store_true", help="predict: keep test features for `rescore`")
+    ap.add_argument("--feats-run", default=None, help="rescore: run id holding test_feats/")
     ap.add_argument("--no-comp", action="store_true", help="tune the decision on val S1 only (no competitor S1)")
     ap.add_argument("--depth", type=int, default=None, help="override xgb max_depth")
     ap.add_argument("--lr", type=float, default=None, help="override xgb learning rate")
@@ -769,7 +818,7 @@ def main() -> None:
         submit_stage(RUNS_DIR / a.run, a.team)
         return
 
-    cfg = Config(run_name=a.name or (f"{a.cmd}_{a.run}" if a.cmd in ("stage2", "decide") else f"dev{a.sample}" if a.sample < 1 else a.cmd),
+    cfg = Config(run_name=a.name or (f"{a.cmd}_{a.run}" if a.cmd in ("stage2", "decide", "rescore", "ce-train", "ce-apply") else f"dev{a.sample}" if a.sample < 1 else a.cmd),
                  sample=a.sample)
     cfg.max_candidates = a.max_cands
     cfg.model, cfg.device, cfg.s1_chunk = a.model, a.device, a.s1_chunk
@@ -780,8 +829,8 @@ def main() -> None:
     if a.lr:
         cfg.xgb_lr = a.lr
     cfg.extra.update(train_max_s1=a.train_max_s1, val_max_s1=a.val_max_s1, max_df=a.max_df, threshold_override=a.threshold,
-                     prep_workers=a.prep_workers, k_name=a.k_name, k_addr=a.k_addr, use_rr=not a.no_rr, use_comp=not a.no_comp,
-                     rr_keep=a.rr_keep, rr_wide=tuple(int(x) for x in a.rr_wide.split(",")), rr_fit_s1=a.rr_fit_s1)
+                     prep_workers=a.prep_workers, k_name=a.k_name, k_addr=a.k_addr, use_rr=not a.no_rr, use_comp=not a.no_comp, save_test_feats=a.save_test_feats,
+                     rr_keep=a.rr_keep, rr_wide=tuple(int(x) for x in a.rr_wide.split(",")), rr_fit_s1=a.rr_fit_s1, rr_tau=a.rr_tau, rr_min=a.rr_min)
     run = Run(cfg.run_name, cfg.to_dict())
     try:
         with HwMonitor(run.dir / "hw.csv"):
@@ -797,6 +846,16 @@ def main() -> None:
                 predict_stage(cfg, run, RUNS_DIR / a.run)
             if a.cmd == "all":
                 predict_stage(cfg, run, run.dir)
+            if a.cmd in ("ce-train", "ce-apply"):
+                import cross_encoder as ce
+                me = sys.modules[__name__]
+                ce_dir = Path(a.ce_dir) if a.ce_dir else ROOT / "models" / f"ce_{a.run}"
+                if a.cmd == "ce-train":
+                    ce.train_ce(me, run, RUNS_DIR / a.run, ce_dir, n_pairs=a.ce_pairs, epochs=a.ce_epochs, seed=cfg.seed)
+                else:
+                    ce.apply_ce(me, cfg, run, RUNS_DIR / a.run, RUNS_DIR / (a.feats_run or a.run), ce_dir)
+            if a.cmd == "rescore":
+                rescore_stage(cfg, run, RUNS_DIR / a.run, RUNS_DIR / a.feats_run)
             if a.cmd == "decide":
                 src = RUNS_DIR / a.run
                 m = json.loads((src / "metrics.json").read_text())
