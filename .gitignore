@@ -20,3 +20,7 @@ runs/
 # System files
 .DS_Store
 Thumbs.db
+
+# Large artefacts (GitHub 100 MB file limit): rebuilt by the pipeline
+models/
+*_submission.zip
