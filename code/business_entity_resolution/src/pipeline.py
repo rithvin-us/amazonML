@@ -550,6 +550,14 @@ def train_stage(cfg: Config, run: Run) -> None:
     gc.collect()
     run.end_stage()
 
+    vtruth = tv.select("s1_idx", "s1_id", "n_true").join(blk.rename({"entity_id": "s1_id"}), on="s1_id", how="left")
+    score_and_tune(cfg, run, model, reranker, va, vtruth, val_ids)
+
+
+def score_and_tune(cfg: Config, run: Run, model: Model, reranker, va: pl.DataFrame, vtruth: pl.DataFrame,
+                   val_ids: pl.Series) -> None:
+    """Score val features, score competitor S1, tune the decision. vtruth: every val S1 (s1_idx, s1_id, n_true,
+    country_n, block), incl. those without candidates."""
     va = va.select("s1_idx", "cand_idx", "label").with_columns(
         pl.Series("p", model.predict(va.select(FEATURES).to_numpy()), dtype=pl.Float32))
     va.write_parquet(run.dir / "val_scored.parquet")  # for offline error analysis / re-decisions
@@ -562,9 +570,8 @@ def train_stage(cfg: Config, run: Run) -> None:
         run.end_stage()
 
     run.start_stage("tune")
-    tvc = tv.select("s1_idx", "n_true")
-    (tv.select("s1_idx", "s1_id", "n_true").join(blk.rename({"entity_id": "s1_id"}), on="s1_id", how="left")
-     .write_parquet(run.dir / "val_truth.parquet"))  # stage 2 (post-hoc) needs every val S1 incl. no-cand ones
+    tvc = vtruth.select("s1_idx", "n_true")
+    vtruth.write_parquet(run.dir / "val_truth.parquet")  # stage 2 / ce-apply need every val S1 incl. no-cand ones
     if scored is not va:  # decision tuned WITH competitors (as on test); val-only numbers logged for reference
         solo = max(tune_decision(va, tvc, cfg.p_floor, run).values(), key=lambda d: d["f05"])
         run.set_metrics(val_f05_no_comp=round(solo["f05"], 5))
@@ -577,19 +584,40 @@ def train_stage(cfg: Config, run: Run) -> None:
                     val_f05_by_decision={k: round(v["f05"], 5) for k, v in res.items()},
                     val_f05_threshold=round(res["threshold"]["f05"], 5),
                     val_f05_excl=round(res["threshold+excl"]["f05"], 5),
-                    val_singleton_frac=round(tv.filter(pl.col("n_true") == 0).height / max(tv.height, 1), 4))
+                    val_singleton_frac=round(vtruth.filter(pl.col("n_true") == 0).height / max(vtruth.height, 1), 4))
     # per-country val breakdown (tells us how France-like generalisation may behave)
-    cmap = s1.select(pl.col("idx").alias("s1_idx"), "country_n")
     per_c = {}
     sel_all = apply_decision(scored, dec, cfg.p_floor)
-    for c in cmap["country_n"].unique().to_list():
-        ids_c = cmap.filter(pl.col("country_n") == c)["s1_idx"].implode()
+    for c in vtruth["country_n"].drop_nulls().unique().to_list():
+        ids_c = vtruth.filter(pl.col("country_n") == c)["s1_idx"].implode()
         per_c[c] = round(eval_selection(sel_all.filter(pl.col("s1_idx").is_in(ids_c)),
                                         tvc.filter(pl.col("s1_idx").is_in(ids_c)))["f05"], 5)
     run.set_metrics(val_f05_by_country=per_c)
     run.log(f"metric val_f05={dec['f05']:.5f} P={dec['precision']:.4f} R={dec['recall']:.4f} "
             f"decision={dec['mode']}:{dec['param']} excl={dec['excl']} by_country={per_c}")
     run.end_stage()
+
+
+def retrain_stage(cfg: Config, run: Run, src: Path) -> None:
+    """New matcher on another run's saved train_feats (same candidates/features, e.g. other depth/lr/seed), then
+    the usual val scoring + competitor-aware tuning. Test: `rescore --run <this> --feats-run <run with test_feats>`."""
+    files = sorted((src / "train_feats").glob("part-*.parquet"))
+    for name in ("reranker.json",):  # predict/rescore of this run must block exactly like the source run
+        if (src / name).exists():
+            shutil.copy(src / name, run.dir / name)
+    reranker = load_reranker(src, cfg.device)
+    es = pl.concat([pl.read_parquet(f).filter(pl.col("is_es")) for f in files])
+    va = pl.concat([pl.read_parquet(f).filter(pl.col("is_val")) for f in files])
+    vtruth = pl.read_parquet(src / "val_truth.parquet")
+    run.log(f"retrain from {src.name}: {len(files)} parts, val pairs {va.height:,}, early-stop pairs {es.height:,}")
+    run.set_metrics(retrain_from=src.name, **{k: v for k, v in json.loads((src / "metrics.json").read_text()).items()
+                                              if k in ("block_recall", "avg_candidates", "n_s1", "n_val_s1")})
+    run.start_stage("train_model")
+    model = train_model(cfg, run, files, es)
+    del es
+    gc.collect()
+    run.end_stage()
+    score_and_tune(cfg, run, model, reranker, va, vtruth, vtruth["s1_id"])
 
 
 # ---------------------------------------------------------------- predict
@@ -775,7 +803,7 @@ def main() -> None:
     for stream in (sys.stdout, sys.stderr):  # Windows console is cp1252: never crash a run on a log line
         stream.reconfigure(errors="backslashreplace")
     ap = argparse.ArgumentParser()
-    ap.add_argument("cmd", choices=["prep", "train", "predict", "all", "submit", "lb", "stage2", "decide", "rescore", "ce-train", "ce-apply"])
+    ap.add_argument("cmd", choices=["prep", "train", "predict", "all", "submit", "lb", "stage2", "decide", "rescore", "ce-train", "ce-apply", "retrain"])
     ap.add_argument("args", nargs="*")
     ap.add_argument("--sample", type=float, default=1.0)
     ap.add_argument("--name", default=None)
@@ -846,6 +874,8 @@ def main() -> None:
                 predict_stage(cfg, run, RUNS_DIR / a.run)
             if a.cmd == "all":
                 predict_stage(cfg, run, run.dir)
+            if a.cmd == "retrain":
+                retrain_stage(cfg, run, RUNS_DIR / a.run)
             if a.cmd in ("ce-train", "ce-apply"):
                 import cross_encoder as ce
                 me = sys.modules[__name__]
